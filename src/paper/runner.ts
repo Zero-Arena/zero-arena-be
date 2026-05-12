@@ -1,6 +1,17 @@
-// The long-running paper-engine loop. Subscribes to a Binance kline
-// stream, drives a SDK PaperEngine instance one bar at a time, snapshots
-// per bar, builds epoch commits every `barsPerEpoch` bars.
+// The long-running paper-engine loop. Two modes:
+//
+//   • WS mode (live):
+//     Subscribes to a Binance kline stream, drives the PaperEngine bar-by-
+//     bar in real time, snapshots per bar, commits one epoch every
+//     `barsPerEpoch` bars (typically 24h).
+//
+//   • Backfill mode (demo / catchup):
+//     Pulls historical candles via REST, loops them through the engine
+//     as fast as the RPC accepts. Used for hackathon demos (replay weeks
+//     of trading in minutes) and operational gap recovery on WS dropout.
+//
+// Engine math is identical in both modes — same hash chain ends up on
+// chain. Only the candle source differs.
 
 import { resolve } from 'node:path';
 import { Agent, PaperEngine, keccak256, type Candle, type Trade } from 'zeroarena';
@@ -37,6 +48,8 @@ export interface RunnerOptions extends PaperConfig {
   optionsHash: `0x${string}`;
   /** Genesis cumulativeHash — must equal the iNFT's static cert runHash. */
   genesisCumulativeHash: `0x${string}`;
+  /** When set, pull historical candles instead of subscribing to WS. */
+  backfillDays?: number;
 }
 
 export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
@@ -77,7 +90,11 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
   const ws = new BinanceWS({ symbol: opts.symbol, interval: opts.interval });
 
   let stopRequested = false;
-  let stopResolve: (() => void) | null = null;
+  // The Promise constructor invokes its executor synchronously, so we
+  // know `stopResolve` is always assigned before any other code observes
+  // it. `!` here lets the type stay `() => void` (non-nullable) so
+  // narrowing in the backfill branch doesn't lose the callable type.
+  let stopResolve!: () => void;
   const done = new Promise<void>((res) => {
     stopResolve = res;
   });
@@ -157,6 +174,43 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
 
   ws.on('error', (err: Error) => log.warn('paper runner ws error', { err: err.message }));
 
+  // Backfill mode: pull historical candles via REST, loop through engine
+  // as fast as RPC accepts. WS subscription stays off; the runner returns
+  // once all historical candles are consumed.
+  if (opts.backfillDays && opts.backfillDays > 0) {
+    log.info('paper runner backfill mode', {
+      tokenId: opts.tokenId.toString(),
+      days: opts.backfillDays,
+    });
+    const fromTs = Date.now() - opts.backfillDays * 86_400_000;
+    const candles = await ws.backfill(fromTs);
+    log.info('backfill fetched candles', { count: candles.length });
+
+    for (const candle of candles) {
+      if (stopRequested) break;
+      await handleCandle(candle);
+    }
+
+    log.info('paper runner backfill complete', {
+      tokenId: opts.tokenId.toString(),
+      processed: candles.length,
+      finalEpochIndex: epochIndex,
+      cumulativeHash,
+    });
+    stopRequested = true;
+    engine.stop();
+    stopResolve?.();
+    return {
+      done,
+      stop: () => {
+        if (stopRequested) return;
+        stopRequested = true;
+        stopResolve();
+      },
+    };
+  }
+
+  // WS mode (production, default).
   if (!opts.dryRun) {
     ws.start();
   } else {
@@ -175,7 +229,7 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
         epochIndex,
         cumulativeHash,
       });
-      stopResolve?.();
+      stopResolve();
     },
   };
 }

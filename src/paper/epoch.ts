@@ -1,4 +1,4 @@
-// Epoch boundary detection + epoch hash + (stubbed) on-chain commit.
+// Epoch boundary detection + epoch hash + on-chain submission.
 //
 // Per RFC-001 §6 the on-chain LiveCertificate.update() consumes:
 //   • epochIndex          — strictly monotonic
@@ -8,9 +8,11 @@
 // The off-chain envelope (full trades + equity curve, encrypted with the
 // owner's existing AES key) gets uploaded to 0G Storage in parallel.
 //
-// In v0.3 the operator's wallet pays the gas. In v0.4 the call is signed
-// by a TEE attestation quote whose contents include the same payload.
+// In v0.3 the operator's wallet signs the update. In v0.4 the call is
+// signed inside a TEE attestation enclave whose quote is verified by the
+// contract — the ABI does not change.
 
+import { Contract, JsonRpcProvider, Wallet } from 'ethers';
 import {
   computeMetrics,
   hashTrades,
@@ -20,6 +22,7 @@ import {
   type Trade,
 } from 'zeroarena';
 import { log } from '../log.js';
+import { LIVE_CERTIFICATE_ABI } from './abi.js';
 
 export interface EpochInput {
   tokenId: bigint;
@@ -92,25 +95,83 @@ export function buildEpochCommit(input: EpochInput): EpochCommit {
   };
 }
 
+// ─── on-chain submission ─────────────────────────────────────────────────
+
 /**
- * STUB: submit the epoch to LiveCertificate.update() on chain. v0.3 wires
- * this to ethers + the operator wallet. v0.4 swaps in TEE attestation.
- *
- * Today the function just logs — the LiveCertificate contract exists in
- * `zero-arena-contracts` but is not yet deployed. Operator runs in dry-run
- * mode until deployment completes.
+ * Lazy-init singleton — one Wallet + Contract per process. Built on first
+ * call to `submitEpochOnChain`. Throws clearly if required env is missing.
  */
-export async function submitEpochOnChain(commit: EpochCommit, tokenId: bigint): Promise<void> {
-  // TODO(v0.3): wire to ethers Contract(LiveCertificate, signer).update(
-  //   tokenId, commit.epochIndex, commit.epochHash,
-  //   commit.liveTotalReturnBps, commit.liveSharpeX1000,
-  //   commit.liveMaxDrawdownBps, commit.liveWinRateBps,
-  // );
-  log.info('paper epoch (would submit on-chain — stubbed in Phase 1)', {
+let cachedContract: Contract | null = null;
+let cachedWallet: Wallet | null = null;
+
+function buildContract(): { contract: Contract; wallet: Wallet } {
+  if (cachedContract && cachedWallet) {
+    return { contract: cachedContract, wallet: cachedWallet };
+  }
+  const rpc = process.env.ZA_RPC ?? 'https://evmrpc-testnet.0g.ai';
+  const operatorKey = process.env.OPERATOR_PRIVATE_KEY;
+  const liveCertAddr = process.env.ZA_ADDR_LIVE_CERT;
+  if (!operatorKey) {
+    throw new Error(
+      'OPERATOR_PRIVATE_KEY is required for live mode (must match LiveCertificate.authorizedUpdaters)',
+    );
+  }
+  if (!liveCertAddr) {
+    throw new Error('ZA_ADDR_LIVE_CERT is required (the deployed LiveCertificate address)');
+  }
+  const provider = new JsonRpcProvider(rpc);
+  const wallet = new Wallet(operatorKey, provider);
+  const contract = new Contract(liveCertAddr, LIVE_CERTIFICATE_ABI, wallet);
+  cachedContract = contract;
+  cachedWallet = wallet;
+  return { contract, wallet };
+}
+
+/**
+ * Submit one epoch's commit to LiveCertificate.update() on Galileo. Awaits
+ * one confirmation before returning. Throws on revert so the caller can
+ * decide whether to retry or escalate.
+ */
+export async function submitEpochOnChain(
+  commit: EpochCommit,
+  tokenId: bigint,
+): Promise<{ txHash: string; blockNumber: number }> {
+  const { contract, wallet } = buildContract();
+
+  // Galileo testnet enforces a >2 gwei priority fee; bumping to 3 gwei
+  // matches the convention used in the AgentCertificate deploy scripts.
+  const overrides = { gasPrice: 3_000_000_000n };
+
+  log.info('paper epoch submitting on-chain', {
+    operator: await wallet.getAddress(),
     tokenId: tokenId.toString(),
     epoch: commit.epochIndex,
-    hash: commit.epochHash,
+  });
+
+  const update = contract.update;
+  if (typeof update !== 'function') {
+    throw new Error('LiveCertificate ABI missing update()');
+  }
+  const tx = await update(
+    tokenId,
+    commit.epochIndex,
+    commit.epochHash,
+    commit.liveTotalReturnBps,
+    commit.liveSharpeX1000,
+    commit.liveMaxDrawdownBps,
+    commit.liveWinRateBps,
+    overrides,
+  );
+  const receipt = await tx.wait();
+  if (!receipt) throw new Error('paper epoch tx wait returned null');
+
+  log.info('paper epoch committed on-chain', {
+    tokenId: tokenId.toString(),
+    epoch: commit.epochIndex,
+    tx: receipt.hash,
+    block: receipt.blockNumber,
     return: commit.liveTotalReturnBps,
     sharpe: commit.liveSharpeX1000,
   });
+  return { txHash: receipt.hash as string, blockNumber: Number(receipt.blockNumber) };
 }

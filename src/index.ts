@@ -46,7 +46,7 @@ function printUsage(): void {
     `usage:\n` +
       `  bacend dataset {start|ingest|upload}\n` +
       `  bacend oracle  serve\n` +
-      `  bacend paper   {start|smoke}\n`,
+      `  bacend paper   {start|backfill}\n`,
   );
 }
 

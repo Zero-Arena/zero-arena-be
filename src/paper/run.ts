@@ -1,6 +1,8 @@
 // CLI dispatch for the `paper` service.
 //
-//   bacend paper start    — connect to Binance WS, drive PaperEngine live
+//   bacend paper start              — connect to Binance WS, drive engine live
+//   bacend paper backfill --days N  — pull last N days via REST + replay fast
+//                                     (for demos + gap recovery)
 //
 // Operator config is read from environment (PAPER_* in zero-arena-bacend/.env):
 //   PAPER_TOKEN_ID         iNFT token id this run targets       (required)
@@ -16,6 +18,10 @@
 //   PAPER_BARS_PER_EPOCH   bars per on-chain commit              (default 96)
 //   PAPER_SNAPSHOT_PATH    snapshot disk path
 //   PAPER_DRY_RUN          if "true", skip on-chain submit
+//
+// Chain config (only required when DRY_RUN=false):
+//   OPERATOR_PRIVATE_KEY   wallet authorized in LiveCertificate.authorizedUpdaters
+//   ZA_ADDR_LIVE_CERT      deployed LiveCertificate address
 
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -30,7 +36,10 @@ export const description =
 export async function run(sub: string | undefined): Promise<void> {
   switch (sub) {
     case 'start':
-      await startCommand();
+      await startCommand({ mode: 'ws' });
+      break;
+    case 'backfill':
+      await startCommand({ mode: 'backfill' });
       break;
     default:
       printUsage();
@@ -39,7 +48,11 @@ export async function run(sub: string | undefined): Promise<void> {
 }
 
 function printUsage(): void {
-  process.stderr.write(`usage:\n  bacend paper start\n`);
+  process.stderr.write(
+    `usage:\n` +
+      `  bacend paper start              — connect to Binance WS, drive engine live\n` +
+      `  bacend paper backfill           — replay last PAPER_BACKFILL_DAYS days fast\n`,
+  );
 }
 
 async function loadAgent(modulePath: string): Promise<Agent> {
@@ -52,7 +65,11 @@ async function loadAgent(modulePath: string): Promise<Agent> {
   return new ctor();
 }
 
-function buildRunnerOpts(cfg: PaperConfig, agent: Agent): RunnerOptions {
+function buildRunnerOpts(
+  cfg: PaperConfig,
+  agent: Agent,
+  backfillDays: number | undefined,
+): RunnerOptions {
   const agentHash = hashAgent(agent) as `0x${string}`;
   const optionsHash = hashOptions(cfg.options) as `0x${string}`;
 
@@ -64,16 +81,18 @@ function buildRunnerOpts(cfg: PaperConfig, agent: Agent): RunnerOptions {
   }
   const genesisCumulativeHash = (genesisRaw ?? ('0x' + '00'.repeat(32))) as `0x${string}`;
 
-  return {
+  const ret: RunnerOptions = {
     ...cfg,
     agent,
     agentHash,
     optionsHash,
     genesisCumulativeHash,
   };
+  if (backfillDays !== undefined) ret.backfillDays = backfillDays;
+  return ret;
 }
 
-async function startCommand(): Promise<void> {
+async function startCommand(opts: { mode: 'ws' | 'backfill' }): Promise<void> {
   const cfg = paperConfigFromEnv();
   const agentModule = process.env.PAPER_AGENT_MODULE;
   if (!agentModule) {
@@ -81,9 +100,13 @@ async function startCommand(): Promise<void> {
   }
 
   const agent = await loadAgent(agentModule);
-  const opts = buildRunnerOpts(cfg, agent);
+  const backfillDays =
+    opts.mode === 'backfill'
+      ? Number(process.env.PAPER_BACKFILL_DAYS ?? '7')
+      : undefined;
+  const runnerOpts = buildRunnerOpts(cfg, agent, backfillDays);
 
-  log.info('paper start', {
+  log.info(opts.mode === 'backfill' ? 'paper backfill' : 'paper start', {
     tokenId: cfg.tokenId.toString(),
     symbol: cfg.symbol,
     interval: cfg.interval,
@@ -91,9 +114,10 @@ async function startCommand(): Promise<void> {
     barsPerEpoch: cfg.barsPerEpoch,
     dryRun: cfg.dryRun,
     snapshot: cfg.snapshotPath,
+    backfillDays,
   });
 
-  const handle = await startRunner(opts);
+  const handle = await startRunner(runnerOpts);
 
   process.on('SIGINT', () => {
     log.info('SIGINT — graceful shutdown');
