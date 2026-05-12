@@ -30,6 +30,7 @@ async function main(): Promise<void> {
   const services: Record<string, () => Promise<ServiceModule>> = {
     dataset: () => import('./dataset/run.js'),
     oracle: () => import('./oracle/run.js'),
+    paper: () => import('./paper/run.js'),
   };
 
   const loader = services[service];
@@ -44,7 +45,8 @@ function printUsage(): void {
   process.stderr.write(
     `usage:\n` +
       `  bacend dataset {start|ingest|upload}\n` +
-      `  bacend oracle  serve\n`,
+      `  bacend oracle  serve\n` +
+      `  bacend paper   {start|smoke}\n`,
   );
 }
 
