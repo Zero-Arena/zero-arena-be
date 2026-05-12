@@ -1,113 +1,60 @@
 # zero-arena-bacend
 
-Backend services for Zero Arena. The repo hosts **two sibling services**
-in one process tree, one `.env`, one CLI dispatcher:
+Two backend services for Zero Arena, one repo, one CLI dispatcher. They do **not** share an `.env` and normally run on different hosts.
 
-| Service | Job | Holds the key? |
+| Service | Job | Key held |
 | - | - | - |
-| `dataset` | Poll Binance for BTC/USDT 15-minute candles, write canonical CSV, upload to 0G Storage, rotate `datasets.lock.json`. | Operator wallet (pays gas) |
-| `oracle`  | HTTP signing service for the ERC-7857 re-encryption proof the SDK's `transferAgent` needs. | **Oracle key** — never leaves this process |
-
-Splitting these from the published SDK is the architectural fix that 0.1.0
-got wrong: previously the SDK asked every npm consumer to put
-`ORACLE_PRIVATE_KEY` in their own `.env`. They never need to. The key
-lives here, in the workspace operator's backplane.
-
-**The two services share no env keys.** They run on different hosts in
-production with different threat models. `.env.dataset.example` and
-`.env.oracle.example` are kept separate on purpose; do not concatenate
-them unless you are running both services in the same dev process.
+| `dataset` | Poll Binance → canonical CSV → 0G Storage → rotate `datasets.lock.json`. | Operator wallet (gas) |
+| `oracle`  | HTTP signer for the ERC-7857 re-encryption proof used by `transferAgent`. | Oracle key (signing) |
 
 ## Layout
 
 ```
-zero-arena-bacend/
-├── src/
-│   ├── index.ts            # CLI dispatch — `bacend <service> <subcommand>`
-│   ├── env.ts              # Single .env loader (called once at entry)
-│   ├── log.ts              # Shared structured logger
-│   ├── dataset/
-│   │   ├── run.ts          # subcommand dispatch (start | ingest | upload)
-│   │   ├── config.ts       # BACKEND_* env vars
-│   │   ├── binance.ts      # data-api.binance.vision klines client
-│   │   ├── csv.ts          # canonical CSV read/write
-│   │   ├── lock.ts         # datasets.lock.json with rotating history[]
-│   │   ├── ingest.ts       # fetch → merge → write pipeline
-│   │   ├── upload.ts       # CSV → 0G Storage + update lock
-│   │   └── scheduler.ts    # wall-clock-aligned 30-min loop
-│   └── oracle/
-│       ├── run.ts          # subcommand dispatch (serve)
-│       ├── config.ts       # ORACLE_* env vars
-│       ├── server.ts       # Node-native HTTP, no framework
-│       ├── signer.ts       # the ONLY place that touches ORACLE_PRIVATE_KEY
-│       └── validate.ts     # strict request-body validator
-└── data/
-    ├── btcusdt-15m.csv      (gitignored — bytes live on 0G Storage)
-    └── datasets.lock.json   (committed)
+src/
+├── index.ts            CLI dispatch — `bacend <service> <sub>`
+├── env.ts              .env loader
+├── log.ts
+├── dataset/
+│   ├── run.ts          start | ingest | upload
+│   ├── binance.ts      klines client
+│   ├── csv.ts          canonical read/write
+│   ├── lock.ts         datasets.lock.json (rotating history[])
+│   ├── ingest.ts       fetch → merge → write
+│   ├── upload.ts       CSV → 0G Storage + lock update
+│   ├── scheduler.ts    wall-clock-aligned loop
+│   ├── config.ts       BACKEND_* env
+│   └── sdkConfig.ts    OPERATOR_PRIVATE_KEY → ZeroArenaConfig
+└── oracle/
+    ├── run.ts          serve
+    ├── server.ts       Node http, no framework
+    ├── signer.ts       only place that touches ORACLE_PRIVATE_KEY
+    ├── validate.ts     request validator
+    └── config.ts       ORACLE_* env
 ```
 
-## Commands
+## Run
 
 ```bash
 npm install
 
-# Pick exactly one — the two services do not share a .env.
-cp .env.dataset.example .env   # → for `bacend dataset *`
-cp .env.oracle.example  .env   # → for `bacend oracle serve`
+# Pick exactly one — services do NOT share .env.
+cp .env.dataset.example .env       # for `bacend dataset *`
+cp .env.oracle.example  .env       # for `bacend oracle serve`
 
-# Dataset service ────────────────────────────────────────────────────────
-# One-shot fetch new candles, write CSV. No 0G Storage interaction.
-npm run dataset:ingest
+# Dataset service
+npm run dataset:ingest             # fetch new candles, no upload
+npm run dataset:upload             # fetch + push to 0G Storage
+npm run dataset:start              # scheduler (BACKEND_AUTO_UPLOAD=true to push every tick)
 
-# Same as ingest, then upload to 0G Storage and rotate the lock.
-npm run dataset:upload
-
-# Long-running scheduler. Set BACKEND_AUTO_UPLOAD=true to also push every tick.
-npm run dataset:start
-
-# Oracle service ─────────────────────────────────────────────────────────
-# HTTP signer on http://0.0.0.0:8787 (configurable). Run in a separate
-# terminal — it's a long-lived daemon. The dataset service is independent
-# and does not require this to be running.
-npm run oracle:serve
+# Oracle service
+npm run oracle:serve               # http://0.0.0.0:8787
 ```
 
-## Wiring the oracle into an SDK consumer
+## Oracle HTTP API
 
-```ts
-import { ZeroArena, HttpOracleClient } from 'zeroarena';
+`GET /health` → `{ "status": "ok", "signer": "0x…" }` — compare `signer` against the on-chain `ReencryptionOracle.signer()`.
 
-const za = new ZeroArena({
-  rpc, indexer, privateKey,
-  addresses: { ... },
-  oracle: new HttpOracleClient({
-    url: 'http://localhost:8787',          // wherever you run oracle:serve
-    headers: { authorization: 'Bearer <ORACLE_AUTH_TOKEN>' }, // if set
-  }),
-});
-
-await za.transferAgent({ tokenId, to, recipientPubKey });
-```
-
-The SDK has **no `ORACLE_PRIVATE_KEY` field**. It never auto-loads an
-oracle key from environment variables. The only path to a working
-`transferAgent` is constructing an `OracleClient` at the call site.
-
-## HTTP API (oracle service)
-
-### `GET /health`
-
-```jsonc
-200 { "status": "ok", "signer": "0xDEf4B61EAF80eEd763c2D5C443e2b56cB2d600D1" }
-```
-
-Compare `signer` to the on-chain `ReencryptionOracle.signer()` to verify
-the deployed contract authorizes this service.
-
-### `POST /sign-transfer-proof`
-
-Body (`Content-Type: application/json`) — every numeric field is a
-decimal string so JSON parsers don't truncate `uint256`:
+`POST /sign-transfer-proof` — body (all numerics as decimal strings to preserve `uint256`):
 
 ```jsonc
 {
@@ -116,48 +63,53 @@ decimal string so JSON parsers don't truncate `uint256`:
   "tokenId": "42",
   "from": "0x...",
   "to": "0x...",
-  "sealedKeyHash": "0x...",      // 32 bytes
-  "newMetadataHash": "0x...",    // 32 bytes
+  "sealedKeyHash": "0x...",        // 32 bytes
+  "newMetadataHash": "0x...",      // 32 bytes
   "deadline": "1747915200"
 }
 ```
 
-Response:
+→ `200 { "signature": "0x..." }` — EIP-191 over `keccak(abi.encode(tuple))`. The digest matches the SDK's `oracleDigest` export byte-for-byte.
 
-```jsonc
-200 { "signature": "0x..." }    // EIP-191 signature over keccak(abi.encode(tuple))
+## Wiring into an SDK consumer
+
+```ts
+import { ZeroArena, HttpOracleClient } from 'zeroarena';
+
+const za = new ZeroArena({
+  rpc, indexer, privateKey, addresses,
+  oracle: new HttpOracleClient({
+    url: 'http://localhost:8787',
+    headers: { authorization: 'Bearer <ORACLE_AUTH_TOKEN>' },   // optional
+  }),
+});
+
+await za.transferAgent({ tokenId, to, recipientPubKey });
 ```
 
-The digest computed inside the signer is the SDK's `oracleDigest` export,
-so the client (`HttpOracleClient`) and the server are byte-identical by
-construction.
+The SDK has no `ORACLE_PRIVATE_KEY` field — the key never leaves this process.
 
 ## Configuration
 
-| Variable | Default | Purpose |
-| - | - | - |
-| `BACKEND_SYMBOL` | `BTCUSDT` | Binance trading pair |
-| `BACKEND_INTERVAL` | `15m` | Candle granularity |
-| `BACKEND_BOOTSTRAP_START` | `2025-01-01` | First-run history start (YYYY-MM-DD, YYYY-MM, or ms epoch) |
-| `BACKEND_POLL_MINUTES` | `30` | Scheduler cadence |
-| `BACKEND_GRACE_SECONDS` | `20` | Delay past each boundary so Binance has finalized the last candle |
-| `BACKEND_AUTO_UPLOAD` | `false` | If true, `dataset:start` also uploads to 0G Storage every tick |
-| `ZA_RPC` | `https://evmrpc-testnet.0g.ai` | 0G Chain RPC |
-| `ZA_INDEXER` | `https://indexer-storage-testnet-turbo.0g.ai` | 0G Storage indexer |
-| `OPERATOR_PRIVATE_KEY` | _(required for `dataset:upload`)_ | Workspace operator wallet with Galileo gas. **Not** the SDK consumer's key. (Legacy alias `PRIVATE_KEY` still accepted for one release; emits a deprecation warning at boot.) |
-| `ZA_ADDR_CERT` / `ZA_ADDR_INFT` / `ZA_ADDR_ORACLE` | _(required for `dataset:upload`)_ | Galileo contract addresses |
-| `ORACLE_PRIVATE_KEY` | _(required for `oracle:serve` only)_ | Key matching on-chain `ReencryptionOracle.signer()`. Held by the host running the oracle service; never set on the dataset host. |
-| `ORACLE_HOST` | `0.0.0.0` | HTTP bind |
-| `ORACLE_PORT` | `8787` | HTTP port |
-| `ORACLE_AUTH_TOKEN` | _(unset)_ | Bearer-token gate for `/sign-transfer-proof` |
+| Variable | Default | Service | Notes |
+| - | - | - | - |
+| `BACKEND_SYMBOL` | `BTCUSDT` | dataset | Binance pair |
+| `BACKEND_INTERVAL` | `15m` | dataset | candle granularity |
+| `BACKEND_BOOTSTRAP_START` | `2025-01-01` | dataset | first-run history start |
+| `BACKEND_POLL_MINUTES` | `30` | dataset | scheduler cadence |
+| `BACKEND_GRACE_SECONDS` | `20` | dataset | wait past each boundary |
+| `BACKEND_AUTO_UPLOAD` | `false` | dataset | scheduler also uploads each tick |
+| `ZA_RPC` | testnet | dataset (upload) | 0G Chain RPC |
+| `ZA_INDEXER` | testnet | dataset (upload) | 0G Storage indexer |
+| `OPERATOR_PRIVATE_KEY` | _required_ | dataset (upload) | Operator wallet. **Not** the SDK consumer key. Legacy `PRIVATE_KEY` alias still accepted, removed in v0.3. |
+| `ZA_ADDR_CERT` / `ZA_ADDR_INFT` / `ZA_ADDR_ORACLE` | _required_ | dataset (upload) | Galileo addresses |
+| `ORACLE_PRIVATE_KEY` | _required_ | oracle | matches on-chain `ReencryptionOracle.signer()` |
+| `ORACLE_HOST` | `0.0.0.0` | oracle | http bind |
+| `ORACLE_PORT` | `8787` | oracle | http port |
+| `ORACLE_AUTH_TOKEN` | _unset_ | oracle | bearer gate on `/sign-transfer-proof` |
 
 ## Trust model
 
-The oracle service in v0.1 is the trusted-stub: it signs whatever
-well-formed request it receives. Run it on infrastructure you control,
-set `ORACLE_AUTH_TOKEN` for anything not on localhost, and treat
-`ORACLE_PRIVATE_KEY` with the same care as a wallet seed phrase.
+v0.1 oracle is a trusted stub — it signs every well-formed request. Run it on infrastructure you control, set `ORACLE_AUTH_TOKEN` outside localhost, treat `ORACLE_PRIVATE_KEY` like a wallet seed.
 
-v0.2 swaps this for a TEE-attested service running inside a 0G Compute
-enclave, where the same `signer.ts` runs unchanged but is gated by an
-attestation report proving the signer is the expected enclave image.
+v0.2 swaps the stub for a TEE-attested signer inside a 0G Compute enclave. `signer.ts` doesn't change — only the trust root.
