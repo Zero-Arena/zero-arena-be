@@ -13,6 +13,11 @@ got wrong: previously the SDK asked every npm consumer to put
 `ORACLE_PRIVATE_KEY` in their own `.env`. They never need to. The key
 lives here, in the workspace operator's backplane.
 
+**The two services share no env keys.** They run on different hosts in
+production with different threat models. `.env.dataset.example` and
+`.env.oracle.example` are kept separate on purpose; do not concatenate
+them unless you are running both services in the same dev process.
+
 ## Layout
 
 ```
@@ -45,7 +50,10 @@ zero-arena-bacend/
 
 ```bash
 npm install
-cp .env.example .env       # fill PRIVATE_KEY (dataset) + ORACLE_PRIVATE_KEY (oracle)
+
+# Pick exactly one — the two services do not share a .env.
+cp .env.dataset.example .env   # → for `bacend dataset *`
+cp .env.oracle.example  .env   # → for `bacend oracle serve`
 
 # Dataset service ────────────────────────────────────────────────────────
 # One-shot fetch new candles, write CSV. No 0G Storage interaction.
@@ -136,9 +144,9 @@ construction.
 | `BACKEND_AUTO_UPLOAD` | `false` | If true, `dataset:start` also uploads to 0G Storage every tick |
 | `ZA_RPC` | `https://evmrpc-testnet.0g.ai` | 0G Chain RPC |
 | `ZA_INDEXER` | `https://indexer-storage-testnet-turbo.0g.ai` | 0G Storage indexer |
-| `PRIVATE_KEY` | _(required for upload)_ | Operator wallet with Galileo gas |
-| `ZA_ADDR_CERT` / `ZA_ADDR_INFT` / `ZA_ADDR_ORACLE` | _(required for upload)_ | Galileo contract addresses |
-| `ORACLE_PRIVATE_KEY` | _(required for oracle:serve)_ | Key matching on-chain `ReencryptionOracle.signer()` |
+| `OPERATOR_PRIVATE_KEY` | _(required for `dataset:upload`)_ | Workspace operator wallet with Galileo gas. **Not** the SDK consumer's key. (Legacy alias `PRIVATE_KEY` still accepted for one release; emits a deprecation warning at boot.) |
+| `ZA_ADDR_CERT` / `ZA_ADDR_INFT` / `ZA_ADDR_ORACLE` | _(required for `dataset:upload`)_ | Galileo contract addresses |
+| `ORACLE_PRIVATE_KEY` | _(required for `oracle:serve` only)_ | Key matching on-chain `ReencryptionOracle.signer()`. Held by the host running the oracle service; never set on the dataset host. |
 | `ORACLE_HOST` | `0.0.0.0` | HTTP bind |
 | `ORACLE_PORT` | `8787` | HTTP port |
 | `ORACLE_AUTH_TOKEN` | _(unset)_ | Bearer-token gate for `/sign-transfer-proof` |
