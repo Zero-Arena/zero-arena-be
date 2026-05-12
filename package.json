@@ -1,0 +1,25 @@
+{
+  "name": "zero-arena-bacend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend services for Zero Arena. Hosts two sibling services in one repo: `dataset` (Binance fetch → canonical CSV → 0G Storage) and `oracle` (ERC-7857 re-encryption proof signer).",
+  "bin": {
+    "zero-arena-bacend": "src/index.ts"
+  },
+  "scripts": {
+    "dataset:start": "tsx src/index.ts dataset start",
+    "dataset:ingest": "tsx src/index.ts dataset ingest",
+    "dataset:upload": "tsx src/index.ts dataset upload",
+    "oracle:serve": "tsx src/index.ts oracle serve",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zeroarena": "file:../sdk"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.0"
+  }
+}

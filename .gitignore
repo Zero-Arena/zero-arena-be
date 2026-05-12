@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+
+# Cached price data — datasets.lock.json is committed; raw CSVs live on 0G Storage.
+data/*.csv
