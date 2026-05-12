@@ -3,10 +3,10 @@
 // `history[]`.
 
 import { ZeroArena } from 'zeroarena';
-import { configFromEnv } from 'zeroarena/dist/cli/env.js';
-import { CSV_PATH, DATASET_KEY, INTERVAL, LOCK_PATH, SYMBOL } from './config.js';
+import { DATASET_KEY, INTERVAL, LOCK_PATH, SYMBOL } from './config.js';
 import type { IngestResult } from './ingest.js';
 import { applyUpload, loadLock, saveLock } from './lock.js';
+import { datasetSdkConfig } from './sdkConfig.js';
 import { log } from '../log.js';
 
 export interface UploadResult {
@@ -17,7 +17,7 @@ export interface UploadResult {
 }
 
 export async function upload(result: IngestResult): Promise<UploadResult> {
-  const za = new ZeroArena(configFromEnv());
+  const za = new ZeroArena(datasetSdkConfig());
   log.info('uploading dataset to 0G Storage', { path: result.csvPath });
 
   const ds = await za.uploadDataset(result.csvPath);
