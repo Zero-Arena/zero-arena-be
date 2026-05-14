@@ -1,35 +1,35 @@
 # zero-arena-bacend
 
-Two backend services for Zero Arena, one repo, one CLI dispatcher. They do **not** share an `.env` and normally run on different hosts.
+Two services for Zero Arena. Dataset ingest moved to the SDK in 0.2.0
+(`npx zeroarena dataset ingest …`) — this repo now hosts only the two
+runtime services that need long-running state.
 
 | Service | Job | Key held |
 | - | - | - |
-| `dataset` | Poll Binance → canonical CSV → 0G Storage → rotate `datasets.lock.json`. | Operator wallet (gas) |
-| `oracle`  | HTTP signer for the ERC-7857 re-encryption proof used by `transferAgent`. | Oracle key (signing) |
+| `transfer-oracle` | HTTP signer for the ERC-7857 re-encryption proof used by `transferAgent`. | Oracle ECDSA signer key |
+| `paper`           | Long-running PaperEngine daemon — drives the engine bar-by-bar, commits one `EpochCommitted` to `LiveCertificate` every `barsPerEpoch`. | Operator wallet (gas) |
 
 ## Layout
 
 ```
 src/
-├── index.ts            CLI dispatch — `bacend <service> <sub>`
-├── env.ts              .env loader
+├── index.ts                CLI dispatch
+├── env.ts                  .env loader
 ├── log.ts
-├── dataset/
-│   ├── run.ts          start | ingest | upload
-│   ├── binance.ts      klines client
-│   ├── csv.ts          canonical read/write
-│   ├── lock.ts         datasets.lock.json (rotating history[])
-│   ├── ingest.ts       fetch → merge → write
-│   ├── upload.ts       CSV → 0G Storage + lock update
-│   ├── scheduler.ts    wall-clock-aligned loop
-│   ├── config.ts       BACKEND_* env
-│   └── sdkConfig.ts    OPERATOR_PRIVATE_KEY → ZeroArenaConfig
-└── oracle/
-    ├── run.ts          serve
-    ├── server.ts       Node http, no framework
-    ├── signer.ts       only place that touches ORACLE_PRIVATE_KEY
-    ├── validate.ts     request validator
-    └── config.ts       ORACLE_* env
+├── transfer-oracle/
+│   ├── run.ts              serve
+│   ├── server.ts           Node http + per-IP rate limit
+│   ├── signer.ts           only place that touches ORACLE_PRIVATE_KEY
+│   ├── validate.ts         request validator
+│   └── config.ts           ORACLE_* env
+└── paper/
+    ├── run.ts              start | backfill
+    ├── runner.ts           PaperEngine driver loop
+    ├── binance-ws.ts       kline subscriber (with REST backfill)
+    ├── epoch.ts            buildEpochCommit + submitEpochOnChain
+    ├── snapshot.ts         per-bar persistence
+    ├── config.ts           PAPER_* env
+    └── abi.ts              minimal LiveCertificate ABI
 ```
 
 ## Run
@@ -38,23 +38,22 @@ src/
 npm install
 
 # Pick exactly one — services do NOT share .env.
-cp .env.dataset.example .env       # for `bacend dataset *`
-cp .env.oracle.example  .env       # for `bacend oracle serve`
+cp .env.transfer-oracle.example .env   # for `transfer-oracle serve`
+cp .env.paper.example           .env   # for `paper {start,backfill}`
 
-# Dataset service
-npm run dataset:ingest             # fetch new candles, no upload
-npm run dataset:upload             # fetch + push to 0G Storage
-npm run dataset:start              # scheduler (BACKEND_AUTO_UPLOAD=true to push every tick)
+# Transfer-oracle service
+npm run transfer-oracle:serve          # http://0.0.0.0:8787
 
-# Oracle service
-npm run oracle:serve               # http://0.0.0.0:8787
+# Paper service
+npm run paper:start                    # live WS subscription
+npm run paper:backfill                 # REST replay (demo / catchup)
 ```
 
-## Oracle HTTP API
+## Transfer-oracle HTTP API
 
 `GET /health` → `{ "status": "ok", "signer": "0x…" }` — compare `signer` against the on-chain `ReencryptionOracle.signer()`.
 
-`POST /sign-transfer-proof` — body (all numerics as decimal strings to preserve `uint256`):
+`POST /sign-transfer-proof` — body (numerics as decimal strings to preserve `uint256`):
 
 ```jsonc
 {
@@ -63,13 +62,17 @@ npm run oracle:serve               # http://0.0.0.0:8787
   "tokenId": "42",
   "from": "0x...",
   "to": "0x...",
-  "sealedKeyHash": "0x...",        // 32 bytes
-  "newMetadataHash": "0x...",      // 32 bytes
+  "sealedKeyHash": "0x...",
+  "newMetadataHash": "0x...",
   "deadline": "1747915200"
 }
 ```
 
 → `200 { "signature": "0x..." }` — EIP-191 over `keccak(abi.encode(tuple))`. The digest matches the SDK's `oracleDigest` export byte-for-byte.
+
+### Rate limit
+
+Each IP gets **30 requests / 60s** on `/sign-transfer-proof`. Exceeding returns `429` with a `retry-after` header. Memory-only counter — restart clears it.
 
 ## Wiring into an SDK consumer
 
@@ -80,7 +83,7 @@ const za = new ZeroArena({
   rpc, indexer, privateKey, addresses,
   oracle: new HttpOracleClient({
     url: 'http://localhost:8787',
-    headers: { authorization: 'Bearer <ORACLE_AUTH_TOKEN>' },   // optional
+    headers: { authorization: 'Bearer <ORACLE_AUTH_TOKEN>' }, // optional
   }),
 });
 
@@ -89,27 +92,38 @@ await za.transferAgent({ tokenId, to, recipientPubKey });
 
 The SDK has no `ORACLE_PRIVATE_KEY` field — the key never leaves this process.
 
-## Configuration
+## Paper daemon
+
+See `.env.paper.example` for the full env contract. Critical knobs:
+
+| Variable | Notes |
+| - | - |
+| `PAPER_TOKEN_ID` | iNFT this daemon drives. Owner must have called `LiveCertificate.start()` first. |
+| `PAPER_AGENT_MODULE` | Absolute path to the agent module (default-exports an `Agent` subclass). |
+| `PAPER_GENESIS_HASH` | Must equal the iNFT's static-cert `runHash`. |
+| `OPERATOR_PRIVATE_KEY` | Must be in `LiveCertificate.authorizedUpdaters`. |
+| `PAPER_BARS_PER_EPOCH` | 96 = 1 day @ 15m. Use 4 for fast demo cadence. |
+
+## Configuration reference
 
 | Variable | Default | Service | Notes |
 | - | - | - | - |
-| `BACKEND_SYMBOL` | `BTCUSDT` | dataset | Binance pair |
-| `BACKEND_INTERVAL` | `15m` | dataset | candle granularity |
-| `BACKEND_BOOTSTRAP_START` | `2025-01-01` | dataset | first-run history start |
-| `BACKEND_POLL_MINUTES` | `30` | dataset | scheduler cadence |
-| `BACKEND_GRACE_SECONDS` | `20` | dataset | wait past each boundary |
-| `BACKEND_AUTO_UPLOAD` | `false` | dataset | scheduler also uploads each tick |
-| `ZA_RPC` | testnet | dataset (upload) | 0G Chain RPC |
-| `ZA_INDEXER` | testnet | dataset (upload) | 0G Storage indexer |
-| `OPERATOR_PRIVATE_KEY` | _required_ | dataset (upload) | Operator wallet. **Not** the SDK consumer key. Legacy `PRIVATE_KEY` alias still accepted, removed in v0.3. |
-| `ZA_ADDR_CERT` / `ZA_ADDR_INFT` / `ZA_ADDR_ORACLE` | _required_ | dataset (upload) | Galileo addresses |
-| `ORACLE_PRIVATE_KEY` | _required_ | oracle | matches on-chain `ReencryptionOracle.signer()` |
-| `ORACLE_HOST` | `0.0.0.0` | oracle | http bind |
-| `ORACLE_PORT` | `8787` | oracle | http port |
-| `ORACLE_AUTH_TOKEN` | _unset_ | oracle | bearer gate on `/sign-transfer-proof` |
+| `ORACLE_PRIVATE_KEY` | _required_ | transfer-oracle | matches on-chain `ReencryptionOracle.signer()` |
+| `ORACLE_HOST` | `0.0.0.0` | transfer-oracle | http bind |
+| `ORACLE_PORT` | `8787` | transfer-oracle | http port |
+| `ORACLE_AUTH_TOKEN` | _unset_ | transfer-oracle | optional Bearer gate |
+| `PAPER_TOKEN_ID` | _required_ | paper | iNFT to drive |
+| `PAPER_AGENT_MODULE` | _required_ | paper | path to the agent module |
+| `PAPER_GENESIS_HASH` | _required_ | paper | static cert's runHash |
+| `OPERATOR_PRIVATE_KEY` | _required_ | paper | gas + authorized updater |
+| `ZA_RPC` | testnet | both | 0G Chain RPC |
+| `ZA_ADDR_LIVE_CERT` | _required_ | paper | deployed LiveCertificate |
+| `ZA_ADDR_SEASON` | _optional_ | paper | for season enroll |
 
 ## Trust model
 
-v0.1 oracle is a trusted stub — it signs every well-formed request. Run it on infrastructure you control, set `ORACLE_AUTH_TOKEN` outside localhost, treat `ORACLE_PRIVATE_KEY` like a wallet seed.
+v0.1/v0.2: transfer-oracle is a **trusted ECDSA stub**. Run it on infrastructure you control, set `ORACLE_AUTH_TOKEN` if exposed beyond localhost, treat `ORACLE_PRIVATE_KEY` like a wallet seed.
 
-v0.2 swaps the stub for a TEE-attested signer inside a 0G Compute enclave. `signer.ts` doesn't change — only the trust root.
+v0.4: replaces this service with a TEE-attested signer running inside 0G Compute Sealed Inference. The HTTP API is preserved; only the trust root changes.
+
+Paper daemon similarly migrates to run inside a TEE in v0.4 — engine math + agent code execute in-enclave, the on-chain `EpochCommitted` carries a TEE quote alongside the operator signature.

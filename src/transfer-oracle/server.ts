@@ -10,6 +10,37 @@ import { HttpError, parseRequest } from './validate.js';
 
 const MAX_BODY_BYTES = 4 * 1024;
 
+// Sliding-window per-IP rate limiter. Each IP gets RATE_LIMIT_MAX requests
+// per RATE_LIMIT_WINDOW_MS. Memory only — restarting the service resets the
+// counters. Bounded by `maxIps` to cap memory under abuse.
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 30; // 30 sign requests per minute per IP
+
+class RateLimiter {
+  private readonly hits = new Map<string, number[]>();
+  private readonly maxIps = 10_000;
+
+  check(ip: string): { ok: boolean; retryAfter?: number } {
+    const now = Date.now();
+    const cutoff = now - RATE_LIMIT_WINDOW_MS;
+    let arr = this.hits.get(ip);
+    if (!arr) {
+      if (this.hits.size >= this.maxIps) this.hits.clear(); // crude pressure relief
+      arr = [];
+      this.hits.set(ip, arr);
+    }
+    while (arr.length > 0 && arr[0]! < cutoff) arr.shift();
+    if (arr.length >= RATE_LIMIT_MAX) {
+      const retryAfter = Math.ceil((arr[0]! + RATE_LIMIT_WINDOW_MS - now) / 1000);
+      return { ok: false, retryAfter };
+    }
+    arr.push(now);
+    return { ok: true };
+  }
+}
+
+const limiter = new RateLimiter();
+
 export function start(): { stop: () => Promise<void> } {
   const server = createServer((req, res) => {
     handle(req, res).catch((err) => {
@@ -50,6 +81,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       writeJson(res, 401, { error: 'unauthorized' });
       return;
     }
+    const ip = clientIp(req);
+    const rl = limiter.check(ip);
+    if (!rl.ok) {
+      res.setHeader('retry-after', String(rl.retryAfter));
+      writeJson(res, 429, { error: 'rate limit exceeded', retryAfter: rl.retryAfter });
+      return;
+    }
     try {
       const body = await readJson(req);
       const parsed = parseRequest(body);
@@ -78,6 +116,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 function isAuthorized(req: IncomingMessage): boolean {
   if (oracleConfig.authToken.length === 0) return true;
   return req.headers.authorization === `Bearer ${oracleConfig.authToken}`;
+}
+
+function clientIp(req: IncomingMessage): string {
+  // x-forwarded-for first (proxy / load balancer); fall back to socket.
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.length > 0) return fwd.split(',')[0]!.trim();
+  return req.socket.remoteAddress ?? 'unknown';
 }
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
