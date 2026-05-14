@@ -15,7 +15,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "zeroarena": "file:../sdk"
+    "zeroarena": "file:../sdk",
+    "ethers": "^6.13.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

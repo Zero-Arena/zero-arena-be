@@ -1,0 +1,177 @@
+// Epoch boundary detection + epoch hash + on-chain submission.
+//
+// Per RFC-001 §6 the on-chain LiveCertificate.update() consumes:
+//   • epochIndex          — strictly monotonic
+//   • epochHash           — keccak of stableStringify(EpochEnvelope)
+//   • live metrics        — total return / Sharpe / max DD / win rate
+//
+// The off-chain envelope (full trades + equity curve, encrypted with the
+// owner's existing AES key) gets uploaded to 0G Storage in parallel.
+//
+// In v0.3 the operator's wallet signs the update. In v0.4 the call is
+// signed inside a TEE attestation enclave whose quote is verified by the
+// contract — the ABI does not change.
+
+import { Contract, JsonRpcProvider, Wallet } from 'ethers';
+import {
+  computeMetrics,
+  hashTrades,
+  keccak256,
+  stableStringify,
+  toUtf8Bytes,
+  type Trade,
+} from 'zeroarena';
+import { log } from '../log.js';
+import { LIVE_CERTIFICATE_ABI } from './abi.js';
+
+export interface EpochInput {
+  tokenId: bigint;
+  epochIndex: number;
+  windowStartTs: number;
+  windowEndTs: number;
+  trades: Trade[];
+  equityCurve: number[];
+  initialBalance: number;
+  barsPerYear: number;
+  /** runHash + agentHash + optionsHash from the original certificate. */
+  agentHash: `0x${string}`;
+  optionsHash: `0x${string}`;
+}
+
+export interface EpochCommit {
+  epochIndex: number;
+  epochHash: `0x${string}`;
+  windowStartTs: number;
+  windowEndTs: number;
+  tradesHash: `0x${string}`;
+  liveTotalReturnBps: number;
+  liveSharpeX1000: number;
+  liveMaxDrawdownBps: number;
+  liveWinRateBps: number;
+}
+
+/**
+ * Build the canonical epoch envelope, hash it, derive live metrics. Pure —
+ * no chain or network. Inputs are everything the on-chain submission needs.
+ */
+export function buildEpochCommit(input: EpochInput): EpochCommit {
+  const tradesHash = hashTrades(input.trades) as `0x${string}`;
+  const metrics = computeMetrics({
+    initialBalance: input.initialBalance,
+    equityCurve: input.equityCurve,
+    trades: input.trades,
+    barsPerYear: input.barsPerYear,
+  });
+
+  const epochEnvelope = {
+    schema: 'zeroarena.epoch.v1',
+    tokenId: input.tokenId.toString(),
+    epochIndex: input.epochIndex,
+    windowStartTs: input.windowStartTs,
+    windowEndTs: input.windowEndTs,
+    agentHash: input.agentHash,
+    optionsHash: input.optionsHash,
+    tradesHash,
+    barsPerYear: input.barsPerYear,
+    metrics: {
+      totalReturnBps: metrics.totalReturnBps,
+      sharpeX1000: metrics.sharpeX1000,
+      maxDrawdownBps: metrics.maxDrawdownBps,
+      winRateBps: metrics.winRateBps,
+    },
+  };
+  const epochHash = keccak256(toUtf8Bytes(stableStringify(epochEnvelope))) as `0x${string}`;
+
+  return {
+    epochIndex: input.epochIndex,
+    epochHash,
+    windowStartTs: input.windowStartTs,
+    windowEndTs: input.windowEndTs,
+    tradesHash,
+    liveTotalReturnBps: metrics.totalReturnBps,
+    liveSharpeX1000: metrics.sharpeX1000,
+    liveMaxDrawdownBps: metrics.maxDrawdownBps,
+    liveWinRateBps: metrics.winRateBps,
+  };
+}
+
+// ─── on-chain submission ─────────────────────────────────────────────────
+
+/**
+ * Lazy-init singleton — one Wallet + Contract per process. Built on first
+ * call to `submitEpochOnChain`. Throws clearly if required env is missing.
+ */
+let cachedContract: Contract | null = null;
+let cachedWallet: Wallet | null = null;
+
+function buildContract(): { contract: Contract; wallet: Wallet } {
+  if (cachedContract && cachedWallet) {
+    return { contract: cachedContract, wallet: cachedWallet };
+  }
+  const rpc = process.env.ZA_RPC ?? 'https://evmrpc-testnet.0g.ai';
+  const operatorKey = process.env.OPERATOR_PRIVATE_KEY;
+  const liveCertAddr = process.env.ZA_ADDR_LIVE_CERT;
+  if (!operatorKey) {
+    throw new Error(
+      'OPERATOR_PRIVATE_KEY is required for live mode (must match LiveCertificate.authorizedUpdaters)',
+    );
+  }
+  if (!liveCertAddr) {
+    throw new Error('ZA_ADDR_LIVE_CERT is required (the deployed LiveCertificate address)');
+  }
+  const provider = new JsonRpcProvider(rpc);
+  const wallet = new Wallet(operatorKey, provider);
+  const contract = new Contract(liveCertAddr, LIVE_CERTIFICATE_ABI, wallet);
+  cachedContract = contract;
+  cachedWallet = wallet;
+  return { contract, wallet };
+}
+
+/**
+ * Submit one epoch's commit to LiveCertificate.update() on Galileo. Awaits
+ * one confirmation before returning. Throws on revert so the caller can
+ * decide whether to retry or escalate.
+ */
+export async function submitEpochOnChain(
+  commit: EpochCommit,
+  tokenId: bigint,
+): Promise<{ txHash: string; blockNumber: number }> {
+  const { contract, wallet } = buildContract();
+
+  // Galileo testnet enforces a >2 gwei priority fee; bumping to 3 gwei
+  // matches the convention used in the AgentCertificate deploy scripts.
+  const overrides = { gasPrice: 3_000_000_000n };
+
+  log.info('paper epoch submitting on-chain', {
+    operator: await wallet.getAddress(),
+    tokenId: tokenId.toString(),
+    epoch: commit.epochIndex,
+  });
+
+  const update = contract.update;
+  if (typeof update !== 'function') {
+    throw new Error('LiveCertificate ABI missing update()');
+  }
+  const tx = await update(
+    tokenId,
+    commit.epochIndex,
+    commit.epochHash,
+    commit.liveTotalReturnBps,
+    commit.liveSharpeX1000,
+    commit.liveMaxDrawdownBps,
+    commit.liveWinRateBps,
+    overrides,
+  );
+  const receipt = await tx.wait();
+  if (!receipt) throw new Error('paper epoch tx wait returned null');
+
+  log.info('paper epoch committed on-chain', {
+    tokenId: tokenId.toString(),
+    epoch: commit.epochIndex,
+    tx: receipt.hash,
+    block: receipt.blockNumber,
+    return: commit.liveTotalReturnBps,
+    sharpe: commit.liveSharpeX1000,
+  });
+  return { txHash: receipt.hash as string, blockNumber: Number(receipt.blockNumber) };
+}
