@@ -1,11 +1,9 @@
 #!/usr/bin/env -S npx tsx
-// zero-arena-bacend CLI. The backend hosts two distinct services in one
-// repo (and one .env). Pick which to run at the call site:
+// zero-arena-bacend CLI. Two services, one repo. Pick which to run:
 //
-//   bacend dataset start    — wall-clock 30-min ingest scheduler
-//   bacend dataset ingest   — one-shot fetch (no upload)
-//   bacend dataset upload   — fetch + push to 0G Storage
-//   bacend oracle  serve    — HTTP signing service for transferAgent
+//   bacend transfer-oracle serve   — HTTP signing service for transferAgent
+//   bacend paper           start   — long-running PaperEngine daemon (WS)
+//   bacend paper           backfill — replay historical bars to catch up
 
 import { loadBackendEnv } from './env.js';
 import { log } from './log.js';
@@ -19,17 +17,14 @@ interface ServiceModule {
 
 async function main(): Promise<void> {
   const [service, sub, ...rest] = process.argv.slice(2);
-  if (rest.length > 0) {
-    throw new Error(`Unexpected extra argument: "${rest[0]}"`);
-  }
+  if (rest.length > 0) throw new Error(`Unexpected extra argument: "${rest[0]}"`);
   if (!service) {
     printUsage();
     process.exit(1);
   }
 
   const services: Record<string, () => Promise<ServiceModule>> = {
-    dataset: () => import('./dataset/run.js'),
-    oracle: () => import('./oracle/run.js'),
+    'transfer-oracle': () => import('./transfer-oracle/run.js'),
     paper: () => import('./paper/run.js'),
   };
 
@@ -44,9 +39,8 @@ async function main(): Promise<void> {
 function printUsage(): void {
   process.stderr.write(
     `usage:\n` +
-      `  bacend dataset {start|ingest|upload}\n` +
-      `  bacend oracle  serve\n` +
-      `  bacend paper   {start|backfill}\n`,
+      `  bacend transfer-oracle serve\n` +
+      `  bacend paper           {start|backfill}\n`,
   );
 }
 
