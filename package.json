@@ -15,7 +15,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "zeroarena": "^0.2.0",
+    "zeroarena": "^0.2.1",
     "ethers": "^6.13.0"
   },
   "devDependencies": {
