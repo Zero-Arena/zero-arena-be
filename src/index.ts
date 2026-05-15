@@ -16,8 +16,10 @@ interface ServiceModule {
 }
 
 async function main(): Promise<void> {
-  const [service, sub, ...rest] = process.argv.slice(2);
-  if (rest.length > 0) throw new Error(`Unexpected extra argument: "${rest[0]}"`);
+  const [service, sub] = process.argv.slice(2);
+  // Extra positional args (e.g. `bacend season settle <id>`) are read by
+  // the loaded service from process.argv directly. The dispatcher no
+  // longer rejects them.
   if (!service) {
     printUsage();
     process.exit(1);
@@ -26,6 +28,7 @@ async function main(): Promise<void> {
   const services: Record<string, () => Promise<ServiceModule>> = {
     'transfer-oracle': () => import('./transfer-oracle/run.js'),
     paper: () => import('./paper/run.js'),
+    season: () => import('./season/run.js'),
   };
 
   const loader = services[service];
@@ -40,7 +43,8 @@ function printUsage(): void {
   process.stderr.write(
     `usage:\n` +
       `  bacend transfer-oracle serve\n` +
-      `  bacend paper           {start|backfill}\n`,
+      `  bacend paper           {start|backfill}\n` +
+      `  bacend season          {keep|settle|status}\n`,
   );
 }
 
