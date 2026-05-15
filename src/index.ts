@@ -1,9 +1,11 @@
 #!/usr/bin/env -S npx tsx
-// zero-arena-bacend CLI. Two services, one repo. Pick which to run:
+// zero-arena-bacend CLI. Pick which service to run:
 //
-//   bacend transfer-oracle serve   — HTTP signing service for transferAgent
+//   bacend transfer-oracle serve   — HTTP signer for ERC-7857 transfer proofs
 //   bacend paper           start   — long-running PaperEngine daemon (WS)
 //   bacend paper           backfill — replay historical bars to catch up
+//   bacend season          {keep|settle|status} — season auto-settle / ops
+//   bacend onboard         serve   — paper-daemon delegation endpoint (v0.3)
 
 import { loadBackendEnv } from './env.js';
 import { log } from './log.js';
@@ -29,6 +31,7 @@ async function main(): Promise<void> {
     'transfer-oracle': () => import('./transfer-oracle/run.js'),
     paper: () => import('./paper/run.js'),
     season: () => import('./season/run.js'),
+    onboard: () => import('./onboard/run.js'),
   };
 
   const loader = services[service];
@@ -44,7 +47,8 @@ function printUsage(): void {
     `usage:\n` +
       `  bacend transfer-oracle serve\n` +
       `  bacend paper           {start|backfill}\n` +
-      `  bacend season          {keep|settle|status}\n`,
+      `  bacend season          {keep|settle|status}\n` +
+      `  bacend onboard         serve\n`,
   );
 }
 

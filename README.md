@@ -8,7 +8,8 @@ Runtime services that keep the [Zero Arena](https://github.com/Zero-Arena) arena
 | - | - | - | - |
 | `transfer-oracle` | HTTP signer for ERC-7857 re-encryption proofs (`transferAgent`). | Oracle ECDSA signer | ✅ Live · [transfer-oracle-production-f390.up.railway.app](https://transfer-oracle-production-f390.up.railway.app/health) |
 | `season-keeper` | Background daemon — polls `Season` every 60s, calls `settle()` permissionlessly once `endTime` passes. | Operator wallet (gas) | ✅ Live on Railway (no public URL — outbound only) |
-| `paper` | Long-running `PaperEngine` daemon. Subscribes to Binance WS, commits one `EpochCommitted` to `LiveCertificate` per `barsPerEpoch`. **Reference impl — owners self-operate.** | Operator wallet (gas) | ⚪ Per-owner, not centrally hosted |
+| `onboard` | HTTP endpoint for owners to delegate paper-daemon execution to Zero Arena. Spawns one `paper` child process per onboarded tokenId. | Operator wallet (gas) | 🟡 Built, awaiting Railway deploy (v0.3) |
+| `paper` | Long-running `PaperEngine` daemon. Subscribes to Binance WS, commits one `EpochCommitted` to `LiveCertificate` per `barsPerEpoch`. **Reference impl — owners self-operate OR delegate via `onboard`.** | Operator wallet (gas) | ⚪ Owner-operated by default; Operator-attested via `onboard` |
 
 The paper daemon is shipped here as a reference, not a service we run for you. See [Owners self-operate paper](#owners-self-operate-paper).
 
@@ -120,6 +121,73 @@ await za.transferAgent({ tokenId, to, recipientPubKey });
 ```
 
 The SDK has no `ORACLE_PRIVATE_KEY` field — the key never leaves this process.
+
+## Onboard service (v0.3 — operator delegation)
+
+HTTP endpoint that owners use to delegate paper-daemon execution to Zero Arena's backend. The owner first calls `LiveCertificate.authorizeUpdater(tokenId, ZA_OPERATOR_ADDR)` on-chain, then submits a signed authorization + their agent source. The service decrypts in-memory, spawns a per-token `bacend paper start` child process under the operator wallet, and tracks its lifecycle.
+
+### Endpoints
+
+`GET /health` — operator address + active daemon count.
+
+`GET /status` — list of active delegated daemons (tokenId, pid, startedAt).
+
+`POST /onboard` — onboard a tokenId. Body:
+
+```jsonc
+{
+  "payload": {
+    "action": "onboard",
+    "tokenId": "7",
+    "nonce": "0x...",                 // unique per request
+    "deadline": "1747915200"          // unix seconds, must be in the future
+  },
+  "signature": "0x...",               // owner's personal_sign over JSON.stringify(payload, sorted keys)
+  "agentSource": "import { Agent } from 'zeroarena'; export default class MyAgent extends Agent { ... }",
+  "genesisHash": "0x...",             // == iNFT static cert runHash
+  "symbol": "btcusdt",
+  "interval": "15m",
+  "market": "spot",
+  "barsPerEpoch": 96,
+  "initialBalance": 10000,
+  "leverage": 1,
+  "feeBps": 10,
+  "slippageBps": 5
+}
+```
+
+→ `200 { status, tokenId, operator, pid, startedAt }`
+
+`POST /offboard` — stop a delegated daemon. Body:
+
+```jsonc
+{
+  "payload": { "action": "offboard", "tokenId": "7", "nonce": "...", "deadline": "..." },
+  "signature": "0x..."
+}
+```
+
+→ `200 { status, tokenId }`
+
+### Validation flow
+
+1. Parse body, check `deadline` > now.
+2. Recover signer from `signature` over `digestFor(payload)`.
+3. On-chain: `iNFT.ownerOf(tokenId) == signer`.
+4. On-chain: `LiveCertificate.authorizedUpdaters[tokenId][ZA_OPERATOR_ADDR] == true`.
+5. Spawn paper child OR send SIGTERM to existing PID.
+
+If any check fails, return 403 with reason.
+
+### Rate limit + auth
+
+Each IP: 10 onboard/offboard per minute. `ONBOARD_AUTH_TOKEN` optional bearer gate (strongly recommended in production).
+
+### Trust model
+
+Operator-attested: the operator wallet's signature is the trust root for every `EpochCommitted`. We hold the agent source in-memory + ephemeral file (under `ONBOARD_AGENT_DIR`, mode 0600). Bundle is removed on offboard. **v0.3 prototype accepts agent source as plaintext** — production hardening adds ECIES key wrapping so source is encrypted-at-rest before reaching this service.
+
+v0.4: this service moves into 0G Compute TEE. The HTTP surface is preserved; the operator key becomes an enclave key, source never touches a non-enclave disk.
 
 ## Season keeper
 
