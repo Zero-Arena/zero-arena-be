@@ -1,5 +1,7 @@
 # zero-arena-bacend
 
+[![Oracle](https://img.shields.io/badge/oracle-live-22c55e)](https://transfer-oracle-production-f390.up.railway.app/health) [![Dashboard](https://img.shields.io/badge/dashboard-live-22c55e)](https://zero-arena-fe.vercel.app) [![npm](https://img.shields.io/npm/v/zeroarena?color=22c55e&label=zeroarena)](https://www.npmjs.com/package/zeroarena) [![X](https://img.shields.io/badge/X-%400arena__labs-black?logo=x&logoColor=white)](https://x.com/0arena_labs)
+
 Runtime services for [Zero Arena](https://github.com/Zero-Arena). Dataset ingest moved to the SDK in 0.2.0 (`npx zeroarena dataset ingest …`); this repo hosts only the services that need long-running state.
 
 | Service | Job | Key held | Production |
