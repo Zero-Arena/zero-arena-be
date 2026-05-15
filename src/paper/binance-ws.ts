@@ -7,6 +7,9 @@
 // https://binance-docs.github.io/apidocs/spot/en/#kline-candlestick-streams
 
 import { EventEmitter } from 'node:events';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { Candle } from 'zeroarena';
 import { log } from '../log.js';
 
@@ -29,6 +32,70 @@ interface KlinePayload {
 const WS_BASE = 'wss://stream.binance.com:9443/ws';
 const REST_KLINES = 'https://data-api.binance.vision/api/v3/klines';
 const RECONNECT_DELAY_MS = 2000;
+
+/** Cache freshness window — within this age, hit cache without re-fetch. */
+const KLINE_CACHE_FRESH_MS = 60_000;
+
+function klineCacheDir(): string {
+  return process.env.PAPER_KLINE_CACHE_DIR ?? resolve(tmpdir(), 'zero-arena-bacend', 'klines');
+}
+
+function klineCachePath(symbol: string, interval: string, fromTs: number): string {
+  // Round fromTs to the minute so multiple runs within the same minute
+  // share a cache entry.
+  const minuteBucket = Math.floor(fromTs / 60_000);
+  return resolve(klineCacheDir(), `${symbol.toLowerCase()}-${interval}-${minuteBucket}.json`);
+}
+
+interface KlineCacheFile {
+  schema: 'kline-cache.v1';
+  symbol: string;
+  interval: string;
+  fromTs: number;
+  savedAt: number;
+  candles: Candle[];
+}
+
+async function readKlineCache(
+  symbol: string,
+  interval: string,
+  fromTs: number,
+): Promise<KlineCacheFile | null> {
+  try {
+    const path = klineCachePath(symbol, interval, fromTs);
+    const raw = await readFile(path, 'utf8');
+    const parsed = JSON.parse(raw) as KlineCacheFile;
+    if (parsed.schema !== 'kline-cache.v1') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function writeKlineCache(
+  symbol: string,
+  interval: string,
+  fromTs: number,
+  candles: Candle[],
+): Promise<void> {
+  const path = klineCachePath(symbol, interval, fromTs);
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    const data: KlineCacheFile = {
+      schema: 'kline-cache.v1',
+      symbol,
+      interval,
+      fromTs,
+      savedAt: Date.now(),
+      candles,
+    };
+    await writeFile(path, JSON.stringify(data));
+  } catch (err) {
+    log.warn('binance-ws kline cache write failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 export interface BinanceWSOptions {
   symbol: string; // lowercase, e.g. "btcusdt"
@@ -68,8 +135,49 @@ export class BinanceWS extends EventEmitter {
     this.ws = null;
   }
 
-  /** Replay candles between `fromTs` (inclusive) and now via REST. */
+  /**
+   * Replay candles between `fromTs` (inclusive) and now via REST. Results
+   * are cached on disk under PAPER_KLINE_CACHE_DIR (default
+   * `<tmp>/zero-arena-bacend/klines`) so re-running backfill across
+   * multiple agents on the same (symbol, interval) only fetches once.
+   * Cache TTL is 60s — newer "now" requests do a delta-fetch from the
+   * end of the cached window.
+   */
   async backfill(fromTs: number): Promise<Candle[]> {
+    const cached = await readKlineCache(this.opts.symbol, this.opts.interval, fromTs);
+    if (cached) {
+      const ageMs = Date.now() - cached.savedAt;
+      if (ageMs < KLINE_CACHE_FRESH_MS) {
+        log.info('binance-ws backfill cache hit', {
+          symbol: this.opts.symbol,
+          interval: this.opts.interval,
+          count: cached.candles.length,
+          ageMs,
+        });
+        return cached.candles;
+      }
+      // Stale: extend by fetching from the last cached close forward.
+      const extendFrom = cached.candles.length > 0
+        ? (cached.candles[cached.candles.length - 1]!.timestamp + 1)
+        : fromTs;
+      const fresh = await this.fetchKlines(extendFrom);
+      const merged = [...cached.candles, ...fresh];
+      await writeKlineCache(this.opts.symbol, this.opts.interval, fromTs, merged);
+      log.info('binance-ws backfill cache extended', {
+        symbol: this.opts.symbol,
+        interval: this.opts.interval,
+        prior: cached.candles.length,
+        added: fresh.length,
+        total: merged.length,
+      });
+      return merged;
+    }
+    const fresh = await this.fetchKlines(fromTs);
+    await writeKlineCache(this.opts.symbol, this.opts.interval, fromTs, fresh);
+    return fresh;
+  }
+
+  private async fetchKlines(fromTs: number): Promise<Candle[]> {
     const out: Candle[] = [];
     let cursor = fromTs;
     const now = Date.now();
