@@ -8,6 +8,7 @@
     "zero-arena-bacend": "src/index.ts"
   },
   "scripts": {
+    "start": "npm run transfer-oracle:serve",
     "transfer-oracle:serve": "tsx src/index.ts transfer-oracle serve",
     "paper:start": "tsx src/index.ts paper start",
     "paper:backfill": "tsx src/index.ts paper backfill",
