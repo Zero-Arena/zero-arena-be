@@ -142,6 +142,13 @@ export async function submitEpochOnChain(
   // matches the convention used in the AgentCertificate deploy scripts.
   const overrides = { gasPrice: 3_000_000_000n };
 
+  // Contract storage fields are unsigned for Sharpe/MaxDD/WinRate; clamp to >=0
+  // (the off-chain epoch envelope still hashes the raw signed Sharpe, so the
+  // cumulative hash chain preserves the truth for verifiers).
+  const sharpeForChain = Math.max(0, Math.round(commit.liveSharpeX1000));
+  const maxDdForChain = Math.max(0, Math.min(65_535, Math.round(commit.liveMaxDrawdownBps)));
+  const winRateForChain = Math.max(0, Math.min(65_535, Math.round(commit.liveWinRateBps)));
+
   log.info('paper epoch submitting on-chain', {
     operator: await wallet.getAddress(),
     tokenId: tokenId.toString(),
@@ -157,9 +164,9 @@ export async function submitEpochOnChain(
     commit.epochIndex,
     commit.epochHash,
     commit.liveTotalReturnBps,
-    commit.liveSharpeX1000,
-    commit.liveMaxDrawdownBps,
-    commit.liveWinRateBps,
+    sharpeForChain,
+    maxDdForChain,
+    winRateForChain,
     overrides,
   );
   const receipt = await tx.wait();
