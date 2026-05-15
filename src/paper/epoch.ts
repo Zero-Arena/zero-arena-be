@@ -127,10 +127,31 @@ function buildContract(): { contract: Contract; wallet: Wallet } {
   return { contract, wallet };
 }
 
+// Errors whose retry would be pointless — the chain already gave a verdict.
+// EpochOutOfOrder, UnauthorizedUpdater, GenesisMismatch, NotActive, etc. all
+// surface as a top-level "execution reverted" message; bailing fast lets the
+// operator notice + fix.
+function isPermanentChainError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('execution reverted') ||
+    msg.includes('CALL_EXCEPTION') ||
+    msg.includes('out-of-bounds')
+  );
+}
+
+const RETRY_MAX_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 1500;
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Submit one epoch's commit to LiveCertificate.update() on Galileo. Awaits
- * one confirmation before returning. Throws on revert so the caller can
- * decide whether to retry or escalate.
+ * one confirmation before returning. Retries up to 3× with exponential
+ * backoff on transient RPC/network errors; throws immediately on chain
+ * reverts (permanent errors) so the operator can investigate.
  */
 export async function submitEpochOnChain(
   commit: EpochCommit,
@@ -142,36 +163,72 @@ export async function submitEpochOnChain(
   // matches the convention used in the AgentCertificate deploy scripts.
   const overrides = { gasPrice: 3_000_000_000n };
 
+  // Contract storage fields are unsigned for Sharpe/MaxDD/WinRate; clamp to >=0
+  // (the off-chain epoch envelope still hashes the raw signed Sharpe, so the
+  // cumulative hash chain preserves the truth for verifiers).
+  const sharpeForChain = Math.max(0, Math.round(commit.liveSharpeX1000));
+  const maxDdForChain = Math.max(0, Math.min(65_535, Math.round(commit.liveMaxDrawdownBps)));
+  const winRateForChain = Math.max(0, Math.min(65_535, Math.round(commit.liveWinRateBps)));
+
+  const update = contract.update;
+  if (typeof update !== 'function') {
+    throw new Error('LiveCertificate ABI missing update()');
+  }
+
   log.info('paper epoch submitting on-chain', {
     operator: await wallet.getAddress(),
     tokenId: tokenId.toString(),
     epoch: commit.epochIndex,
   });
 
-  const update = contract.update;
-  if (typeof update !== 'function') {
-    throw new Error('LiveCertificate ABI missing update()');
-  }
-  const tx = await update(
-    tokenId,
-    commit.epochIndex,
-    commit.epochHash,
-    commit.liveTotalReturnBps,
-    commit.liveSharpeX1000,
-    commit.liveMaxDrawdownBps,
-    commit.liveWinRateBps,
-    overrides,
-  );
-  const receipt = await tx.wait();
-  if (!receipt) throw new Error('paper epoch tx wait returned null');
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const tx = await update(
+        tokenId,
+        commit.epochIndex,
+        commit.epochHash,
+        commit.liveTotalReturnBps,
+        sharpeForChain,
+        maxDdForChain,
+        winRateForChain,
+        overrides,
+      );
+      const receipt = await tx.wait();
+      if (!receipt) throw new Error('paper epoch tx wait returned null');
 
-  log.info('paper epoch committed on-chain', {
-    tokenId: tokenId.toString(),
-    epoch: commit.epochIndex,
-    tx: receipt.hash,
-    block: receipt.blockNumber,
-    return: commit.liveTotalReturnBps,
-    sharpe: commit.liveSharpeX1000,
-  });
-  return { txHash: receipt.hash as string, blockNumber: Number(receipt.blockNumber) };
+      log.info('paper epoch committed on-chain', {
+        tokenId: tokenId.toString(),
+        epoch: commit.epochIndex,
+        tx: receipt.hash,
+        block: receipt.blockNumber,
+        return: commit.liveTotalReturnBps,
+        sharpe: commit.liveSharpeX1000,
+        attempt,
+      });
+      return { txHash: receipt.hash as string, blockNumber: Number(receipt.blockNumber) };
+    } catch (err) {
+      lastErr = err;
+      if (isPermanentChainError(err) || attempt === RETRY_MAX_ATTEMPTS) {
+        log.error('paper epoch submit failed (permanent or out of attempts)', {
+          tokenId: tokenId.toString(),
+          epoch: commit.epochIndex,
+          attempt,
+          err: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
+      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      log.warn('paper epoch submit transient failure — retrying', {
+        tokenId: tokenId.toString(),
+        epoch: commit.epochIndex,
+        attempt,
+        nextDelayMs: delay,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      await sleep(delay);
+    }
+  }
+  // Unreachable but TS needs it.
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
