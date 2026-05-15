@@ -187,13 +187,13 @@ Railpack 0.23 ignores `RAILWAY_RUN_COMMAND`. To override the default `npm start`
 
 Railway's HTTP proxy expects the app to bind to whatever `PORT` env var is set, even though we also pass `--port 8787` to `railway domain`. Set both `ORACLE_PORT=8787` and `PORT=8787` so the app listens on the port the proxy targets. Without `PORT`, the proxy returns 502 `connection refused` despite the app being healthy.
 
-## Owners self-operate paper
+## Paper daemon — two operator models
 
-The paper daemon runs **per-iNFT**: one process drives one tokenId, commits one `EpochCommitted` tx per epoch. We deliberately do **not** run a paper daemon for every minted iNFT — that would centralize the "live performance" claim onto our infrastructure.
+The paper daemon runs **per-iNFT**: one process drives one tokenId, commits one `EpochCommitted` tx per epoch. Authorization is per-token (`LiveCertificate.authorizedUpdaters[tokenId][operator]`), so the iNFT owner picks who runs the daemon.
 
-The architecture instead: agent owners deploy their own paper daemon. Same code, owner's wallet, owner's server. Authorization is per-token (`LiveCertificate.authorizedUpdaters[tokenId][operator]`), so the owner can also delegate to a third-party operator without surrendering ownership.
+### Option 1 — Owner-operated (today, v0.2)
 
-Run locally first to verify config:
+Owner clones this repo, sets `OPERATOR_PRIVATE_KEY` to their own wallet, deploys to their own infra (Railway, Fly.io, VPS, anywhere with Node 20+).
 
 ```bash
 cp .env.paper.example .env
@@ -201,9 +201,40 @@ cp .env.paper.example .env
 npm run paper:start
 ```
 
-Then deploy to your own infra (Railway, Fly.io, VPS, anywhere with Node 20+). Persistent disk required: paper snapshots write to `./data/paper/snapshot-<tokenId>.json` between bars; without persistence, every restart re-fetches from chain + Binance archive.
+Persistent disk required: paper snapshots write to `./data/paper/snapshot-<tokenId>.json` between bars.
 
-Trust caveat: today the operator signs `update()` with their own key (T2-equivalent — owner can manipulate the live cert as much as they can manipulate the static cert). v0.4 lifts this to T3 by running the engine inside a 0G Compute TEE — the engine's enclave attestation co-signs the epoch, and cherry-picking becomes detectable.
+**Trust caveat — this is owner-attested, not cheat-proof.** The owner controls execution; the on-chain `LiveCertificate.update()` only verifies hash-chain integrity, not that the running agent matches the genesis or that candles are real Binance data. An owner can technically swap agent code, cherry-pick epochs, or feed synthetic candles. Self-operate is transparent (owner accountable to themselves) but every owner has the cheat path. Acceptable for power users who don't want anyone else to touch their strategy.
+
+### Option 2 — Operator-attested via Zero Arena (v0.3, opt-in delegation)
+
+Owner uploads encrypted agent bundle + wraps AES key with Zero Arena's pubkey + signs an authorization. Zero Arena's backend decrypts in-memory only, spawns a daemon per token, and signs `EpochCommitted` with the Zero Arena operator wallet (which the owner has called `authorizeUpdater(tokenId, ZA_OPERATOR_ADDR)` for).
+
+```
+POST /paper/onboard         # owner submits encrypted bundle + signed auth
+POST /paper/offboard        # owner revokes; daemon stops
+```
+
+**Trust shift:** from owner's reputation (private, accountable only to themselves) to Zero Arena's public reputation (one entity, one operator key, accountable to the whole arena). Cheating becomes transparent and reputation-fatal. Strategy is plaintext in-memory inside our process during execution — explicit trust trade-off the owner accepts.
+
+**Status: design committed, endpoint in build.** See the [v0.3 roadmap](#roadmap) below.
+
+### Option 3 — TEE-attested (v0.4)
+
+The same daemon code runs inside a 0G Compute Sealed Inference enclave. Strategy decrypted only inside the TEE; on-chain epochs co-signed by the enclave attestation. No human — owner, Zero Arena, or anyone else — sees the plaintext or can manipulate execution. Trustless.
+
+### When to use which
+
+| You are | Use |
+| - | - |
+| Power user, paranoid about strategy IP | Option 1 (self-operate) |
+| Mass-market user, want frictionless live competition | Option 2 (delegate to Zero Arena) when shipped, Option 1 today |
+| Building toward T3 trust | Option 3 (TEE) when 0G Compute ships |
+
+## Roadmap
+
+- **v0.2** ✅ — Option 1 only. Transfer-oracle + season-keeper hosted, paper as reference impl owners deploy.
+- **v0.3** — Option 2 endpoint shipped here. New `POST /paper/onboard` + `POST /paper/offboard`. Per-token daemon orchestrator. Operator wallet management. FE delegation button.
+- **v0.4** — Option 3 via 0G Compute TEE. Same HTTP surface; trust root changes only.
 
 ## Paper daemon configuration
 
