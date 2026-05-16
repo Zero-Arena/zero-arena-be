@@ -284,10 +284,17 @@ Railway's HTTP proxy expects the app to bind to whatever `PORT` env var is set, 
 
 ### Gotcha — Binance WS region
 
-`wss://stream.binance.com:9443` is geo-blocked from several Railway US-region IP ranges (US-West confirmed). The `paper` daemon — whether self-operated or spawned by `onboard` — needs egress to that host. Two fixes:
+Binance hosts are geo-blocked from several Railway US-region IP ranges (US-West confirmed). The `paper` daemon — whether self-operated or spawned by `onboard` — needs egress to whichever Binance host matches the requested market:
 
-- **Recommended:** deploy the service in **Southeast Asia (Singapore)** via Railway dashboard → Settings → Region. Native WS connects in < 1 s. This is what production `onboard` uses today.
-- **Fallback:** if region is locked, the paper engine auto-detects WS failure and switches to REST polling against `data-api.binance.vision/api/v3/klines` (30 s cadence). Force via `PAPER_BINANCE_MODE=rest`. Latency is invisible at the default 96-bar × 15 m = 24 h epoch cadence.
+| Market | WS host | REST host |
+| - | - | - |
+| spot | `stream.binance.com:9443` | `data-api.binance.vision` |
+| perp (USDT-M) | `fstream.binance.com` | `fapi.binance.com` |
+
+Two fixes:
+
+- **Recommended:** deploy the service in **Southeast Asia (Singapore)** via Railway dashboard → Settings → Region. Native WS connects in < 1 s for both spot and perp. This is what production `onboard` uses today.
+- **Fallback:** if region is locked, the paper engine auto-detects WS failure and switches to REST polling against the same market's REST endpoint (30 s cadence). Force via `PAPER_BINANCE_MODE=rest`. Latency is invisible at the default 96-bar × 15 m = 24 h epoch cadence.
 
 Both transfer-oracle and season-keeper are region-agnostic (no Binance dep).
 
