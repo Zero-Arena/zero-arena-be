@@ -103,6 +103,13 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
     if (stopRequested) return;
     if (windowStartTs === 0) windowStartTs = candle.timestamp;
 
+    log.info('paper candleClose received', {
+      tokenId: opts.tokenId.toString(),
+      candleTs: candle.timestamp,
+      candleTsIso: new Date(candle.timestamp).toISOString(),
+      close: candle.close,
+    });
+
     await engine.onCandleClose(candle);
 
     // Slice the trades + equity for the current epoch.

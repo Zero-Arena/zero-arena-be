@@ -85,6 +85,16 @@ export async function startDaemon(spec: DaemonSpec): Promise<ActiveDaemon> {
         PAPER_DRY_RUN: 'false',
         PAPER_SNAPSHOT_PATH: resolvePath(`./data/paper/snapshot-${k}.json`),
         OPERATOR_PRIVATE_KEY: onboardConfig.operatorPrivateKey,
+        // Force REST polling instead of WebSocket. From Railway Singapore the
+        // perp WS connects but `kline.x === true` events were not arriving
+        // reliably in earlier trials — REST pulls the latest closed candle
+        // every 30s from `fapi.binance.com` (or spot equivalent) which is
+        // observably reliable across the same region.
+        PAPER_BINANCE_MODE: process.env.PAPER_BINANCE_MODE ?? 'rest',
+        // Pre-warm indicators with N days of historical bars before live
+        // ticking starts. Short Seasons (<= 30 min) would otherwise hit
+        // PAPER_WARMUP=26 too late to ever produce a trade signal.
+        PAPER_BACKFILL_DAYS: process.env.PAPER_BACKFILL_DAYS ?? '2',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     },
