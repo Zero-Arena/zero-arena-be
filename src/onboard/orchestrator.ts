@@ -91,10 +91,13 @@ export async function startDaemon(spec: DaemonSpec): Promise<ActiveDaemon> {
         // every 30s from `fapi.binance.com` (or spot equivalent) which is
         // observably reliable across the same region.
         PAPER_BINANCE_MODE: process.env.PAPER_BINANCE_MODE ?? 'rest',
-        // Pre-warm indicators with N days of historical bars before live
-        // ticking starts. Short Seasons (<= 30 min) would otherwise hit
-        // PAPER_WARMUP=26 too late to ever produce a trade signal.
-        PAPER_BACKFILL_DAYS: process.env.PAPER_BACKFILL_DAYS ?? '2',
+        // PAPER_BACKFILL_DAYS intentionally NOT forwarded — the runner uses
+        // it as an XOR switch (backfill-only OR live-only), so setting it
+        // here would replay N days of candles, commit N epochs on chain,
+        // then exit before going live. Live commits start cold (PaperEngine
+        // pushes equity every bar regardless of PAPER_WARMUP=26, so the
+        // chain commits still flow; agent decisions just stay flat for the
+        // first 26 bars).
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     },
