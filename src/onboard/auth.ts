@@ -10,8 +10,13 @@ import { Contract, JsonRpcProvider, Wallet, getAddress, verifyMessage } from 'et
 import { onboardConfig } from './config.js';
 
 const INFT_ABI = ['function ownerOf(uint256 tokenId) view returns (address)'] as const;
+// LiveCertificate.authorizedUpdaters is a global mapping (admin-controlled
+// via setUpdater(onlyOwner)), NOT per-token. Owners cannot grant per-token
+// authorization on-chain; the trust model is: admin curates the operator
+// pool, and the owner's off-chain signed /onboard payload is their consent
+// to delegate to one of those operators.
 const LIVE_CERT_ABI = [
-  'function authorizedUpdaters(uint256 tokenId, address operator) view returns (bool)',
+  'function authorizedUpdaters(address operator) view returns (bool)',
 ] as const;
 
 export type OnboardAction = 'onboard' | 'offboard';
@@ -75,15 +80,15 @@ export async function verifyOwnerAndAuthorization(
   const op = operatorAddress();
   let authorized: boolean;
   try {
-    const authFn = lc.authorizedUpdaters as (id: bigint, operator: string) => Promise<boolean>;
-    authorized = await authFn(tokenId, op);
+    const authFn = lc.authorizedUpdaters as (operator: string) => Promise<boolean>;
+    authorized = await authFn(op);
   } catch (err: unknown) {
     return { ok: false, reason: `authorizedUpdaters check reverted: ${String(err)}` };
   }
   if (!authorized) {
     return {
       ok: false,
-      reason: `operator ${op} is not in LiveCertificate.authorizedUpdaters[${tokenId}] — owner must call authorizeUpdater first`,
+      reason: `operator ${op} is not in LiveCertificate.authorizedUpdaters — admin must call setUpdater(${op}, true) first`,
     };
   }
 

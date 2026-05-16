@@ -124,7 +124,9 @@ The SDK has no `ORACLE_PRIVATE_KEY` field — the key never leaves this process.
 
 ## Onboard service (v0.3 — operator delegation)
 
-HTTP endpoint that owners use to delegate paper-daemon execution to Zero Arena's backend. The owner first calls `LiveCertificate.authorizeUpdater(tokenId, ZA_OPERATOR_ADDR)` on-chain, then submits a signed authorization + their agent source. The service decrypts in-memory, spawns a per-token `bacend paper start` child process under the operator wallet, and tracks its lifecycle.
+HTTP endpoint that owners use to delegate paper-daemon execution to Zero Arena's backend. The owner submits a signed authorization + their agent source; the service decrypts in-memory, spawns a per-token `bacend paper start` child process under the operator wallet, and tracks its lifecycle.
+
+**Trust model nuance:** `LiveCertificate.authorizedUpdaters` is a single global mapping `address => bool`, gated by `onlyOwner` (the admin role). Owners can NOT grant per-token authorization on-chain. Instead, the admin pre-authorizes a curated operator pool, and each owner's signed `/onboard` payload is the off-chain consent to delegate to one of those operators. Owners retain on-chain control via `LiveCertificate.start()` (owner-only, opens the live cert) and `stop()` (owner-only, halts updates).
 
 ### Endpoints
 
@@ -174,7 +176,7 @@ HTTP endpoint that owners use to delegate paper-daemon execution to Zero Arena's
 1. Parse body, check `deadline` > now.
 2. Recover signer from `signature` over `digestFor(payload)`.
 3. On-chain: `iNFT.ownerOf(tokenId) == signer`.
-4. On-chain: `LiveCertificate.authorizedUpdaters[tokenId][ZA_OPERATOR_ADDR] == true`.
+4. On-chain: `LiveCertificate.authorizedUpdaters(ZA_OPERATOR_ADDR) == true` (global, admin-curated).
 5. Spawn paper child OR send SIGTERM to existing PID.
 
 If any check fails, return 403 with reason.
@@ -275,7 +277,7 @@ Persistent disk required: paper snapshots write to `./data/paper/snapshot-<token
 
 ### Option 2 — Operator-attested via Zero Arena (v0.3, opt-in delegation)
 
-Owner uploads encrypted agent bundle + wraps AES key with Zero Arena's pubkey + signs an authorization. Zero Arena's backend decrypts in-memory only, spawns a daemon per token, and signs `EpochCommitted` with the Zero Arena operator wallet (which the owner has called `authorizeUpdater(tokenId, ZA_OPERATOR_ADDR)` for).
+Owner uploads encrypted agent bundle + wraps AES key with Zero Arena's pubkey + signs an authorization. Zero Arena's backend decrypts in-memory only, spawns a daemon per token, and signs `EpochCommitted` with the Zero Arena operator wallet (which the admin has globally added to `LiveCertificate.authorizedUpdaters` ahead of time). Owner's per-token consent is the signed off-chain payload; on-chain participation is gated by `LiveCertificate.start()` (owner-only).
 
 ```
 POST /paper/onboard         # owner submits encrypted bundle + signed auth
