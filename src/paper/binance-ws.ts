@@ -33,6 +33,23 @@ const WS_BASE = 'wss://stream.binance.com:9443/ws';
 const REST_KLINES = 'https://data-api.binance.vision/api/v3/klines';
 const RECONNECT_DELAY_MS = 2000;
 
+// Auto-fallback to REST polling when WS can't connect within this window.
+// Some hosting regions (e.g. several Railway US-West IP ranges) are
+// geo-blocked from `stream.binance.com:9443`, while the data-api.binance.vision
+// REST host stays open. Operators can also force a mode via PAPER_BINANCE_MODE.
+const WS_CONNECT_TIMEOUT_MS = 5_000;
+const REST_POLL_INTERVAL_MS = 30_000;
+
+function intervalToMs(interval: string): number {
+  const m = interval.match(/^(\d+)([smhd])$/);
+  if (!m) throw new Error(`unsupported kline interval: ${interval}`);
+  const n = Number(m[1]);
+  const unit: Record<string, number> = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  const factor = unit[m[2]!];
+  if (!factor) throw new Error(`unsupported kline unit: ${m[2]}`);
+  return n * factor;
+}
+
 /** Cache freshness window — within this age, hit cache without re-fetch. */
 const KLINE_CACHE_FRESH_MS = 60_000;
 
@@ -118,6 +135,10 @@ export class BinanceWS extends EventEmitter {
   private stopped = false;
   private lastCloseTs = 0;
   private readonly streamUrl: string;
+  private wsConnectedOnce = false;
+  private fallbackTimer: NodeJS.Timeout | null = null;
+  private pollHandle: NodeJS.Timeout | null = null;
+  private mode: 'ws' | 'rest' | null = null;
 
   constructor(private readonly opts: BinanceWSOptions) {
     super();
@@ -126,11 +147,42 @@ export class BinanceWS extends EventEmitter {
 
   start(): void {
     this.stopped = false;
+    const forced = (process.env.PAPER_BINANCE_MODE ?? 'auto').toLowerCase();
+    if (forced === 'rest') {
+      this.startRestPolling('forced by PAPER_BINANCE_MODE=rest');
+      return;
+    }
+    // ws or auto — try WS first; auto mode falls back to REST after timeout.
     this.connect();
+    if (forced !== 'ws') {
+      this.fallbackTimer = setTimeout(() => {
+        if (!this.wsConnectedOnce && !this.stopped) {
+          log.warn('binance-ws fallback to REST', {
+            reason: `no WS connection within ${WS_CONNECT_TIMEOUT_MS}ms`,
+            url: this.streamUrl,
+          });
+          try {
+            this.ws?.close();
+          } catch {
+            /* ignore */
+          }
+          this.ws = null;
+          this.startRestPolling(`auto-fallback (region appears to block ${WS_BASE})`);
+        }
+      }, WS_CONNECT_TIMEOUT_MS);
+    }
   }
 
   stop(): void {
     this.stopped = true;
+    if (this.fallbackTimer) {
+      clearTimeout(this.fallbackTimer);
+      this.fallbackTimer = null;
+    }
+    if (this.pollHandle) {
+      clearInterval(this.pollHandle);
+      this.pollHandle = null;
+    }
     this.ws?.close();
     this.ws = null;
   }
@@ -222,6 +274,12 @@ export class BinanceWS extends EventEmitter {
     this.ws = new WebSocket(this.streamUrl);
 
     this.ws.onopen = (): void => {
+      this.wsConnectedOnce = true;
+      this.mode = 'ws';
+      if (this.fallbackTimer) {
+        clearTimeout(this.fallbackTimer);
+        this.fallbackTimer = null;
+      }
       log.info('binance-ws connected', { symbol: this.opts.symbol, interval: this.opts.interval });
       this.emit('reconnect');
     };
@@ -254,9 +312,83 @@ export class BinanceWS extends EventEmitter {
     this.ws.onclose = (evt: { code: number }): void => {
       log.warn('binance-ws closed', { code: evt.code });
       this.ws = null;
-      if (!this.stopped) {
+      // Only reconnect if we are still in WS mode (auto-fallback may have
+      // switched us to REST already; reconnecting WS in that case would
+      // double-emit candleClose events).
+      if (!this.stopped && this.mode === 'ws') {
         setTimeout(() => this.connect(), RECONNECT_DELAY_MS);
       }
     };
+  }
+
+  // ─── REST polling fallback ─────────────────────────────────────────────
+
+  /**
+   * Polls the public Binance data REST endpoint every REST_POLL_INTERVAL_MS,
+   * emitting `candleClose` for any newly-finalized bar (timestamp >
+   * lastCloseTs). Lower-fidelity than WS — bars arrive up to one poll
+   * interval after they close — but works from any region that can reach
+   * `data-api.binance.vision`.
+   */
+  private startRestPolling(reason: string): void {
+    if (this.pollHandle || this.stopped) return;
+    this.mode = 'rest';
+    log.info('binance-rest polling start', {
+      symbol: this.opts.symbol,
+      interval: this.opts.interval,
+      pollMs: REST_POLL_INTERVAL_MS,
+      reason,
+    });
+    this.emit('reconnect');
+
+    const tick = async (): Promise<void> => {
+      if (this.stopped) return;
+      try {
+        const candle = await this.fetchLatestClosed();
+        if (!candle) return;
+        if (candle.timestamp <= this.lastCloseTs) return; // dedupe
+        this.lastCloseTs = candle.timestamp;
+        this.emit('candleClose', candle);
+      } catch (err) {
+        log.warn('binance-rest poll error', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+    void tick();
+    this.pollHandle = setInterval(() => void tick(), REST_POLL_INTERVAL_MS);
+  }
+
+  /** Fetch the most recent fully-closed candle. */
+  private async fetchLatestClosed(): Promise<Candle | null> {
+    const intervalMs = intervalToMs(this.opts.interval);
+    const url = new URL(REST_KLINES);
+    url.searchParams.set('symbol', this.opts.symbol.toUpperCase());
+    url.searchParams.set('interval', this.opts.interval);
+    url.searchParams.set('limit', '2'); // last 2 bars: most recent may still be open
+
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw new Error(`rest poll ${res.status}: ${await res.text()}`);
+    }
+    const rows = (await res.json()) as unknown[][];
+    const now = Date.now();
+    // Walk newest → oldest; pick the first one whose close time has passed.
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const r = rows[i]!;
+      const closeTime = Number(r[6]);
+      const openTime = Number(r[0]);
+      if (closeTime < now && openTime + intervalMs <= now) {
+        return {
+          timestamp: openTime,
+          open: Number(r[1]),
+          high: Number(r[2]),
+          low: Number(r[3]),
+          close: Number(r[4]),
+          volume: Number(r[5]),
+        };
+      }
+    }
+    return null;
   }
 }
