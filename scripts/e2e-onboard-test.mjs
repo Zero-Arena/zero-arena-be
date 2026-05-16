@@ -17,7 +17,7 @@ const owner = new Wallet(ownerKey);
 console.log('owner:', owner.address);
 
 const certHash = execSync(
-  `cast call 0x77f29d2a7BcAC679812d9a0FB1c7508eDA6B087e "get(uint256)((bytes32,bytes32,bytes32,bytes32,int256,uint256,uint256,uint256,address,uint64,uint8,uint8))" 6 --rpc-url https://evmrpc-testnet.0g.ai`,
+  `cast call 0x21a5DEA59cfA07B261d389A9554477e137805c2f "get(uint256)((bytes32,bytes32,bytes32,bytes32,int256,uint256,uint256,uint256,address,uint64,uint8,uint8))" 6 --rpc-url https://evmrpc.0g.ai`,
   { encoding: 'utf8' },
 );
 const fullGenesisHash = certHash.match(/0x[0-9a-fA-F]{64}/)[0];

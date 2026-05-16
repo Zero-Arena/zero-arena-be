@@ -108,7 +108,7 @@ function buildContract(): { contract: Contract; wallet: Wallet } {
   if (cachedContract && cachedWallet) {
     return { contract: cachedContract, wallet: cachedWallet };
   }
-  const rpc = process.env.ZA_RPC ?? 'https://evmrpc-testnet.0g.ai';
+  const rpc = process.env.ZA_RPC ?? 'https://evmrpc.0g.ai';
   const operatorKey = process.env.OPERATOR_PRIVATE_KEY;
   const liveCertAddr = process.env.ZA_ADDR_LIVE_CERT;
   if (!operatorKey) {
@@ -148,20 +148,16 @@ async function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Submit one epoch's commit to LiveCertificate.update() on Galileo. Awaits
- * one confirmation before returning. Retries up to 3× with exponential
- * backoff on transient RPC/network errors; throws immediately on chain
- * reverts (permanent errors) so the operator can investigate.
+ * Submit one epoch's commit to LiveCertificate.update() on 0G mainnet.
+ * Awaits one confirmation before returning. Retries up to 3× with
+ * exponential backoff on transient RPC/network errors; throws immediately on
+ * chain reverts (permanent errors) so the operator can investigate.
  */
 export async function submitEpochOnChain(
   commit: EpochCommit,
   tokenId: bigint,
 ): Promise<{ txHash: string; blockNumber: number }> {
   const { contract, wallet } = buildContract();
-
-  // Galileo testnet enforces a >2 gwei priority fee; bumping to 3 gwei
-  // matches the convention used in the AgentCertificate deploy scripts.
-  const overrides = { gasPrice: 3_000_000_000n };
 
   // Contract storage fields are unsigned for Sharpe/MaxDD/WinRate; clamp to >=0
   // (the off-chain epoch envelope still hashes the raw signed Sharpe, so the
@@ -192,7 +188,6 @@ export async function submitEpochOnChain(
         sharpeForChain,
         maxDdForChain,
         winRateForChain,
-        overrides,
       );
       const receipt = await tx.wait();
       if (!receipt) throw new Error('paper epoch tx wait returned null');

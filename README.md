@@ -17,19 +17,19 @@ The paper daemon is shipped here as a reference, not a service we run for you. S
 
 | Endpoint | URL |
 | - | - |
-| Transfer oracle (Galileo) | `https://transfer-oracle-production-f390.up.railway.app` |
+| Transfer oracle | `https://transfer-oracle-production-f390.up.railway.app` |
 | `/health` | `https://transfer-oracle-production-f390.up.railway.app/health` |
-| 0G Chain RPC (Galileo) | `https://evmrpc-testnet.0g.ai` |
-| 0G Storage indexer | `https://indexer-storage-testnet-turbo.0g.ai` |
-| 0G Explorer | `https://chainscan-galileo.0g.ai` |
+| 0G Chain RPC | `https://evmrpc.0g.ai` |
+| 0G Storage indexer | `https://indexer-storage-turbo.0g.ai` |
+| 0G Explorer | `https://chainscan.0g.ai` |
 
-| Contract (Galileo, chainId 16602) | Address |
+| Contract (0G mainnet, chainId 16661) | Address |
 | - | - |
-| `AgentCertificate` | `0x77f29d2a7BcAC679812d9a0FB1c7508eDA6B087e` |
-| `ZeroArenaINFT` | `0xF7162ecbdB11DE4704043D4aF93B4030AD61700e` |
-| `ReencryptionOracle` | `0x733667CEBB27e310a8fb60799Af73A8C1fe501b2` |
-| `LiveCertificate` | `0x2c71fe022E4698f8fD63384A19Cd69D72a714b4d` |
-| `Season` | `0x8fb87CE34b4e8F4C65eeB6752b0168EC37806CF3` |
+| `AgentCertificate` | `0x21a5DEA59cfA07B261d389A9554477e137805c2f` |
+| `ZeroArenaINFT` | `0x4Bd4d45f206861aa7cD4421785a316A1dD06036f` |
+| `ReencryptionOracle` | `0x63909dA30b0d65ad72b32b3C8C82515f7BFA6Fd6` |
+| `LiveCertificate` | `0x168c244c872f5FC2D737D3126D08e9EEE45fFbc7` |
+| `Season` | `0x4e900860565F9D399B7295c0D28CC7954202524e` |
 
 ## Layout
 
@@ -87,8 +87,8 @@ curl https://transfer-oracle-production-f390.up.railway.app/health
 
 ```jsonc
 {
-  "chainId": "16602",
-  "inftAddress": "0x...",
+  "chainId": "16661",
+  "inftAddress": "0x4Bd4d45f206861aa7cD4421785a316A1dD06036f",
   "tokenId": "42",
   "from": "0x...",
   "to": "0x...",
@@ -261,10 +261,10 @@ railway domain --port 8787
 ```bash
 OP_KEY=$(grep '^OPERATOR_PRIVATE_KEY=' .env | cut -d= -f2-)
 railway add --service season-keeper \
-  --variables "ZA_RPC=https://evmrpc-testnet.0g.ai" \
+  --variables "ZA_RPC=https://evmrpc.0g.ai" \
   --variables "OPERATOR_PRIVATE_KEY=${OP_KEY}" \
-  --variables "ZA_ADDR_SEASON=0x8fb87CE34b4e8F4C65eeB6752b0168EC37806CF3" \
-  --variables "ZA_ADDR_LIVE_CERT=0x2c71fe022E4698f8fD63384A19Cd69D72a714b4d" \
+  --variables "ZA_ADDR_SEASON=0x4e900860565F9D399B7295c0D28CC7954202524e" \
+  --variables "ZA_ADDR_LIVE_CERT=0x168c244c872f5FC2D737D3126D08e9EEE45fFbc7" \
   --variables "SEASON_POLL_INTERVAL_MS=60000" \
   --variables "RAILPACK_START_CMD=npx tsx src/index.ts season keep"
 

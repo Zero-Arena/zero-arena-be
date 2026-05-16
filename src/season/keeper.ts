@@ -12,7 +12,6 @@ import { Contract, JsonRpcProvider, Wallet, type TransactionReceipt } from 'ethe
 import { log } from '../log.js';
 import { SEASON_ABI, LIVE_CERTIFICATE_KEEPER_ABI } from './abi.js';
 
-const GALILEO_GAS_PRICE = 3_000_000_000n;
 const RETRY_MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 2_000;
 
@@ -178,9 +177,9 @@ export async function settleSeason(
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt++) {
     try {
-      const tx = await (season.settle as (id: bigint, hint: bigint[], overrides: { gasPrice: bigint }) => Promise<{
+      const tx = await (season.settle as (id: bigint, hint: bigint[]) => Promise<{
         wait: () => Promise<TransactionReceipt>;
-      }>)(seasonId, hint, { gasPrice: GALILEO_GAS_PRICE });
+      }>)(seasonId, hint);
       const receipt = await tx.wait();
       if (!receipt) throw new Error('settle tx wait returned null');
 

@@ -5,7 +5,7 @@
 //   bacend season status [<id>]     — read on-chain state (no tx)
 //
 // Required env (paper-engine section of zero-arena-bacend/.env):
-//   ZA_RPC                  — Galileo RPC URL
+//   ZA_RPC                  — 0G mainnet RPC URL (chainId 16661)
 //   OPERATOR_PRIVATE_KEY    — pays gas for the settle tx (any wallet works
 //                             since settle() is permissionless; convention
 //                             is to reuse the paper-engine operator key)
@@ -25,7 +25,7 @@ export const description =
   'Season keeper — auto-settle paper-trading seasons after endTime';
 
 function buildConfig(): KeeperConfig {
-  const rpc = process.env.ZA_RPC ?? 'https://evmrpc-testnet.0g.ai';
+  const rpc = process.env.ZA_RPC ?? 'https://evmrpc.0g.ai';
   const operatorKey = process.env.OPERATOR_PRIVATE_KEY;
   const seasonAddress = process.env.ZA_ADDR_SEASON;
   const liveCertAddress = process.env.ZA_ADDR_LIVE_CERT;

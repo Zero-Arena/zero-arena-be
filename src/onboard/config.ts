@@ -29,8 +29,8 @@ export const onboardConfig = {
   get operatorPrivateKey(): string {
     return required('OPERATOR_PRIVATE_KEY');
   },
-  /** Galileo RPC for ownership + authorization checks. */
-  rpc: optional('ZA_RPC', 'https://evmrpc-testnet.0g.ai'),
+  /** 0G mainnet RPC (chainId 16661) for ownership + authorization checks. */
+  rpc: optional('ZA_RPC', 'https://evmrpc.0g.ai'),
   /** Deployed ZeroArenaINFT — used to verify ownerOf(tokenId). */
   get inftAddress(): string {
     return required('ZA_ADDR_INFT');
