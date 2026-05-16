@@ -15,6 +15,7 @@ import {
   parseOnboard,
 } from './validate.js';
 import { installShutdownHandlers, isActive, listActive, startDaemon, stopDaemon } from './orchestrator.js';
+import { decryptAgentBundle, operatorPubKey, SCHEME_V1 } from './crypto.js';
 
 const MAX_BODY_BYTES = 256 * 1024; // 256 KiB — leaves room for a reasonable agent source
 
@@ -86,6 +87,8 @@ async function handleHealth(_req: IncomingMessage, res: ServerResponse): Promise
   json(res, 200, {
     status: 'ok',
     operator: operatorAddress(),
+    operatorPubKey: operatorPubKey(),
+    encryptionScheme: SCHEME_V1,
     active: listActive().length,
     authRequired: Boolean(onboardConfig.authToken),
   });
@@ -133,9 +136,29 @@ async function handleOnboard(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // Decrypt agent bundle if it arrived as an ECIES envelope. Plaintext
+  // remains in memory only; the spawn pipeline writes it to a 0o600
+  // ephemeral file under ONBOARD_AGENT_DIR.
+  let agentSource: string;
+  let mode: 'plaintext' | 'encrypted';
+  if (typeof req2.agentSource === 'string') {
+    agentSource = req2.agentSource;
+    mode = 'plaintext';
+  } else {
+    try {
+      agentSource = decryptAgentBundle(req2.agentSource);
+      mode = 'encrypted';
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      json(res, 400, { error: 'agent bundle decrypt failed', reason: msg });
+      return;
+    }
+  }
+  log.info('onboard.agent-source', { tokenId: tokenId.toString(), mode, bytes: agentSource.length });
+
   const daemon = await startDaemon({
     tokenId,
-    agentSource: req2.agentSource,
+    agentSource,
     genesisHash: req2.genesisHash,
     symbol: req2.symbol,
     interval: req2.interval,
