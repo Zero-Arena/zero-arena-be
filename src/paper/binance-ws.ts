@@ -29,8 +29,15 @@ interface KlinePayload {
   };
 }
 
-const WS_BASE = 'wss://stream.binance.com:9443/ws';
-const REST_KLINES = 'https://data-api.binance.vision/api/v3/klines';
+// Spot endpoints (works from Singapore region; geo-blocked from some US ranges).
+const WS_BASE_SPOT = 'wss://stream.binance.com:9443/ws';
+const REST_KLINES_SPOT = 'https://data-api.binance.vision/api/v3/klines';
+
+// USDT-M perpetual futures endpoints.
+const WS_BASE_PERP = 'wss://fstream.binance.com/ws';
+const REST_KLINES_PERP = 'https://fapi.binance.com/fapi/v1/klines';
+const REST_FUNDING_PERP = 'https://fapi.binance.com/fapi/v1/fundingRate';
+
 const RECONNECT_DELAY_MS = 2000;
 
 // Auto-fallback to REST polling when WS can't connect within this window.
@@ -117,6 +124,8 @@ async function writeKlineCache(
 export interface BinanceWSOptions {
   symbol: string; // lowercase, e.g. "btcusdt"
   interval: string; // "15m", "1h", ...
+  /** Market type — selects spot vs perp WS/REST endpoints. Default 'spot'. */
+  market?: 'spot' | 'perp';
 }
 
 export interface BinanceWSEvents {
@@ -140,9 +149,15 @@ export class BinanceWS extends EventEmitter {
   private pollHandle: NodeJS.Timeout | null = null;
   private mode: 'ws' | 'rest' | null = null;
 
+  private readonly wsBase: string;
+  private readonly restKlines: string;
+
   constructor(private readonly opts: BinanceWSOptions) {
     super();
-    this.streamUrl = `${WS_BASE}/${opts.symbol.toLowerCase()}@kline_${opts.interval}`;
+    const isPerp = opts.market === 'perp';
+    this.wsBase = isPerp ? WS_BASE_PERP : WS_BASE_SPOT;
+    this.restKlines = isPerp ? REST_KLINES_PERP : REST_KLINES_SPOT;
+    this.streamUrl = `${this.wsBase}/${opts.symbol.toLowerCase()}@kline_${opts.interval}`;
   }
 
   start(): void {
@@ -167,7 +182,7 @@ export class BinanceWS extends EventEmitter {
             /* ignore */
           }
           this.ws = null;
-          this.startRestPolling(`auto-fallback (region appears to block ${WS_BASE})`);
+          this.startRestPolling(`auto-fallback (region appears to block ${this.wsBase})`);
         }
       }, WS_CONNECT_TIMEOUT_MS);
     }
@@ -234,7 +249,7 @@ export class BinanceWS extends EventEmitter {
     let cursor = fromTs;
     const now = Date.now();
     while (cursor < now) {
-      const url = new URL(REST_KLINES);
+      const url = new URL(this.restKlines);
       url.searchParams.set('symbol', this.opts.symbol.toUpperCase());
       url.searchParams.set('interval', this.opts.interval);
       url.searchParams.set('startTime', String(cursor));
@@ -362,7 +377,7 @@ export class BinanceWS extends EventEmitter {
   /** Fetch the most recent fully-closed candle. */
   private async fetchLatestClosed(): Promise<Candle | null> {
     const intervalMs = intervalToMs(this.opts.interval);
-    const url = new URL(REST_KLINES);
+    const url = new URL(this.restKlines);
     url.searchParams.set('symbol', this.opts.symbol.toUpperCase());
     url.searchParams.set('interval', this.opts.interval);
     url.searchParams.set('limit', '2'); // last 2 bars: most recent may still be open

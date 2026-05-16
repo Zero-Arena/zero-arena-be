@@ -87,7 +87,7 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
     // For Phase 1 MVP the snapshot is metadata-only.
   }
 
-  const ws = new BinanceWS({ symbol: opts.symbol, interval: opts.interval });
+  const ws = new BinanceWS({ symbol: opts.symbol, interval: opts.interval, market: opts.market });
 
   let stopRequested = false;
   // The Promise constructor invokes its executor synchronously, so we
