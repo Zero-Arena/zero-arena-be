@@ -8,7 +8,7 @@ Runtime services that keep the [Zero Arena](https://github.com/Zero-Arena) arena
 | - | - | - | - |
 | `transfer-oracle` | HTTP signer for ERC-7857 re-encryption proofs (`transferAgent`). | Oracle ECDSA signer | ✅ Live · [transfer-oracle-production-f390.up.railway.app](https://transfer-oracle-production-f390.up.railway.app/health) |
 | `season-keeper` | Background daemon — polls `Season` every 60s, calls `settle()` permissionlessly once `endTime` passes. | Operator wallet (gas) | ✅ Live on Railway (no public URL — outbound only) |
-| `onboard` | HTTP endpoint for owners to delegate paper-daemon execution to Zero Arena. Spawns one `paper` child process per onboarded tokenId. | Operator wallet (gas) | 🟡 Built, awaiting Railway deploy (v0.3) |
+| `onboard` | HTTP endpoint for owners to delegate paper-daemon execution to Zero Arena. Spawns one `paper` child process per onboarded tokenId. Native Binance WS. | Operator wallet (gas) | ✅ Live · [onboard-production-ed6c.up.railway.app](https://onboard-production-ed6c.up.railway.app/health) (Singapore region) |
 | `paper` | Long-running `PaperEngine` daemon. Subscribes to Binance WS, commits one `EpochCommitted` to `LiveCertificate` per `barsPerEpoch`. **Reference impl — owners self-operate OR delegate via `onboard`.** | Operator wallet (gas) | ⚪ Owner-operated by default; Operator-attested via `onboard` |
 
 The paper daemon is shipped here as a reference, not a service we run for you. See [Owners self-operate paper](#owners-self-operate-paper).
@@ -256,6 +256,15 @@ Railpack 0.23 ignores `RAILWAY_RUN_COMMAND`. To override the default `npm start`
 ### Gotcha — proxy needs `PORT`
 
 Railway's HTTP proxy expects the app to bind to whatever `PORT` env var is set, even though we also pass `--port 8787` to `railway domain`. Set both `ORACLE_PORT=8787` and `PORT=8787` so the app listens on the port the proxy targets. Without `PORT`, the proxy returns 502 `connection refused` despite the app being healthy.
+
+### Gotcha — Binance WS region
+
+`wss://stream.binance.com:9443` is geo-blocked from several Railway US-region IP ranges (US-West confirmed). The `paper` daemon — whether self-operated or spawned by `onboard` — needs egress to that host. Two fixes:
+
+- **Recommended:** deploy the service in **Southeast Asia (Singapore)** via Railway dashboard → Settings → Region. Native WS connects in < 1 s. This is what production `onboard` uses today.
+- **Fallback:** if region is locked, the paper engine auto-detects WS failure and switches to REST polling against `data-api.binance.vision/api/v3/klines` (30 s cadence). Force via `PAPER_BINANCE_MODE=rest`. Latency is invisible at the default 96-bar × 15 m = 24 h epoch cadence.
+
+Both transfer-oracle and season-keeper are region-agnostic (no Binance dep).
 
 ## Paper daemon — two operator models
 
