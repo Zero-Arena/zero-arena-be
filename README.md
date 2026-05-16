@@ -187,7 +187,32 @@ Each IP: 10 onboard/offboard per minute. `ONBOARD_AUTH_TOKEN` optional bearer ga
 
 ### Trust model
 
-Operator-attested: the operator wallet's signature is the trust root for every `EpochCommitted`. We hold the agent source in-memory + ephemeral file (under `ONBOARD_AGENT_DIR`, mode 0600). Bundle is removed on offboard. **v0.3 prototype accepts agent source as plaintext** — production hardening adds ECIES key wrapping so source is encrypted-at-rest before reaching this service.
+Operator-attested: the operator wallet's signature is the trust root for every `EpochCommitted`. We hold the agent source in-memory + ephemeral file (under `ONBOARD_AGENT_DIR`, mode 0600). Bundle is removed on offboard.
+
+`agentSource` accepts two shapes:
+
+- **Plaintext string** (legacy/debug): the source travels over TLS in the clear; intermediaries (TLS-terminating proxies, reverse proxies) can theoretically inspect.
+- **ECIES-encrypted bundle** (recommended): owner encrypts to the operator's secp256k1 pubkey, server decrypts in-memory only. Use the `HttpOnboardClient` from `zeroarena` 0.4+ which encrypts automatically.
+
+```jsonc
+"agentSource": {
+  "scheme": "ecies-secp256k1-aes256gcm-v1",
+  "blob": "<base64 ECIES blob>"
+}
+```
+
+Fetch the operator pubkey from `GET /health`:
+
+```jsonc
+{
+  "status": "ok",
+  "operator": "0xB1a5402E…",
+  "operatorPubKey": "0x02…",   // 33-byte compressed secp256k1
+  "encryptionScheme": "ecies-secp256k1-aes256gcm-v1",
+  "active": 0,
+  "authRequired": true
+}
+```
 
 v0.4: this service moves into 0G Compute TEE. The HTTP surface is preserved; the operator key becomes an enclave key, source never touches a non-enclave disk.
 

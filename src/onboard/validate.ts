@@ -3,6 +3,7 @@
 // frameworks.
 
 import type { OnboardAction, SignedPayload } from './auth.js';
+import { type EncryptedAgentBundle, isEncryptedBundle } from './crypto.js';
 
 export class HttpError extends Error {
   constructor(public readonly status: number, message: string) {
@@ -58,7 +59,8 @@ function asMarket(s: string | undefined): 'spot' | 'perp' {
 export interface OnboardRequest {
   payload: SignedPayload;
   signature: string;
-  agentSource: string;
+  /** Either plaintext source (legacy) or an ECIES bundle to decrypt server-side. */
+  agentSource: string | EncryptedAgentBundle;
   genesisHash: `0x${string}`;
   symbol: string;
   interval: string;
@@ -98,10 +100,25 @@ export function parseOnboard(raw: unknown): OnboardRequest {
   }
   asPositiveBigInt(payload.tokenId, 'payload.tokenId');
 
+  // agentSource accepts either a plaintext string (legacy) or an encrypted
+  // bundle object: { scheme, blob }.
+  const rawAgent = o.agentSource;
+  let agentSource: string | EncryptedAgentBundle;
+  if (typeof rawAgent === 'string' && rawAgent.length > 0) {
+    agentSource = rawAgent;
+  } else if (isEncryptedBundle(rawAgent)) {
+    agentSource = rawAgent;
+  } else {
+    throw new HttpError(
+      400,
+      `field "agentSource" must be a non-empty string OR an encrypted bundle { scheme, blob }`,
+    );
+  }
+
   return {
     payload,
     signature: asString(o, 'signature'),
-    agentSource: asString(o, 'agentSource'),
+    agentSource,
     genesisHash: asHex32(asString(o, 'genesisHash'), 'genesisHash'),
     symbol: (o.symbol as string | undefined ?? 'btcusdt').toLowerCase(),
     interval: (o.interval as string | undefined) ?? '15m',
