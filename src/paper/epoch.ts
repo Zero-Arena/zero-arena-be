@@ -120,6 +120,11 @@ function buildContract(): { contract: Contract; wallet: Wallet } {
     throw new Error('ZA_ADDR_LIVE_CERT is required (the deployed LiveCertificate address)');
   }
   const provider = new JsonRpcProvider(rpc);
+  // Ethers' default pollingInterval is 4000ms — too slow on 0G mainnet where
+  // block time is sub-second. Lowering this brings `tx.wait()` round-trip
+  // from ~8s (poll miss × 2) down to ~300-500ms, which is what unlocks
+  // sub-second commit cadence per daemon.
+  provider.pollingInterval = 250;
   const wallet = new Wallet(operatorKey, provider);
   const contract = new Contract(liveCertAddr, LIVE_CERTIFICATE_ABI, wallet);
   cachedContract = contract;

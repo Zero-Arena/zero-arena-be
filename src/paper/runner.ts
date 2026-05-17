@@ -14,11 +14,25 @@
 // chain. Only the candle source differs.
 
 import { resolve } from 'node:path';
-import { Agent, PaperEngine, keccak256, type Candle, type Trade } from 'zeroarena';
+import { Contract, JsonRpcProvider } from 'ethers';
+import {
+  Agent,
+  PaperEngine,
+  computeMetrics,
+  keccak256,
+  type Candle,
+  type Trade,
+} from 'zeroarena';
 import { log } from '../log.js';
 import { BinanceWS } from './binance-ws.js';
-import { loadSnapshot, saveSnapshot, type PaperSnapshot } from './snapshot.js';
+import {
+  loadSnapshot,
+  saveSnapshot,
+  type LiveMetricsSnapshot,
+  type PaperSnapshot,
+} from './snapshot.js';
 import { buildEpochCommit, submitEpochOnChain, type EpochInput } from './epoch.js';
+import { LIVE_CERTIFICATE_ABI } from './abi.js';
 import type { PaperConfig } from './config.js';
 
 /** Bars per year for Sharpe / Sortino annualization (mirrors SDK resolver). */
@@ -37,6 +51,22 @@ const BARS_PER_YEAR: Record<string, number> = {
   '1d': 365,
 };
 
+/**
+ * Compute bars/year for any `\d+[smhd]` interval. Used for sub-minute
+ * synthetic-candle modes (5s, 30s) that aren't in the static table.
+ */
+function barsPerYearOf(interval: string): number | undefined {
+  if (BARS_PER_YEAR[interval] !== undefined) return BARS_PER_YEAR[interval];
+  const m = interval.match(/^(\d+)([smhd])$/);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  const unitSec: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+  const sec = unitSec[m[2]!];
+  if (!sec) return undefined;
+  const secPerYear = 86_400 * 365;
+  return secPerYear / (n * sec);
+}
+
 export interface RunnerHandle {
   done: Promise<void>;
   stop: () => void;
@@ -53,10 +83,10 @@ export interface RunnerOptions extends PaperConfig {
 }
 
 export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
-  const barsPerYear = BARS_PER_YEAR[opts.interval];
+  const barsPerYear = barsPerYearOf(opts.interval);
   if (!barsPerYear) {
     throw new Error(
-      `unsupported interval "${opts.interval}". Supported: ${Object.keys(BARS_PER_YEAR).join(', ')}`,
+      `unsupported interval "${opts.interval}". Expected \\d+[smhd] (e.g. 5s, 1m, 1h).`,
     );
   }
 
@@ -85,6 +115,22 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
     // (RSI/EMA recurrence values) so we can pick up mid-epoch without
     // replaying since-genesis. v0.3 stub: backfill via REST + replay.
     // For Phase 1 MVP the snapshot is metadata-only.
+  } else if (!opts.dryRun) {
+    // No local snapshot but live mode — Railway redeploys wipe the ephemeral
+    // disk, while the on-chain run state survives. Read the current
+    // cumulativeHash + epochCount from the contract so we pick up where the
+    // chain expects us, instead of trying to submit epochIndex=0 against a
+    // chain that already accepted prior epochs.
+    const seed = await readChainSeed(opts.tokenId);
+    if (seed) {
+      log.info('paper runner seeded from chain state', {
+        tokenId: opts.tokenId.toString(),
+        chainEpochCount: seed.epochCount,
+        chainCumulativeHash: seed.cumulativeHash,
+      });
+      epochIndex = seed.epochCount;
+      cumulativeHash = seed.cumulativeHash;
+    }
   }
 
   const ws = new BinanceWS({ symbol: opts.symbol, interval: opts.interval, market: opts.market });
@@ -118,6 +164,31 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
     const epochTrades = allTrades.slice(tradeCountAtLastEpoch);
     const epochEquity = allEquity.slice(barCountAtLastEpoch);
 
+    // Compute LIFETIME live metrics for the FE (off-chain) — these update
+    // every candle close (every ~1s with sub-minute intervals), independent
+    // of the chain-commit cadence which fires only every `barsPerEpoch` bars.
+    const lifetimeMetrics = computeMetrics({
+      initialBalance: opts.options.initialBalance,
+      equityCurve: allEquity,
+      trades: allTrades,
+      barsPerYear,
+    });
+    const closedTrades = allTrades.filter((t) =>
+      t.reason === 'close' || t.reason === 'flip' || t.reason === 'liquidation'
+        || t.reason === 'stop_loss' || t.reason === 'take_profit',
+    ).length;
+    const liveMetrics: LiveMetricsSnapshot = {
+      totalReturnBps: lifetimeMetrics.totalReturnBps,
+      sharpeX1000: lifetimeMetrics.sharpeX1000,
+      maxDrawdownBps: lifetimeMetrics.maxDrawdownBps,
+      winRateBps: lifetimeMetrics.winRateBps,
+      profitFactorX1000: lifetimeMetrics.profitFactorX1000,
+      numClosedTrades: closedTrades,
+      totalTradeEvents: allTrades.length,
+      equity: lifetimeMetrics.finalEquity,
+      lastPrice: candle.close,
+    };
+
     const snap: PaperSnapshot = {
       schema: 'zeroarena.paper.snapshot.v1',
       tokenId: opts.tokenId.toString(),
@@ -128,6 +199,7 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
       cumulativeHash,
       pendingTrades: epochTrades,
       pendingEquity: epochEquity,
+      liveMetrics,
     };
     await saveSnapshot(snapshotPath, snap);
 
@@ -167,12 +239,40 @@ export async function startRunner(opts: RunnerOptions): Promise<RunnerHandle> {
     }
   };
 
+  // Serialize candle processing. A previous handleCandle may still be
+  // awaiting `submitEpochOnChain` (which can take several seconds with
+  // operator-wallet contention). Without this guard, sub-block-time
+  // intervals (1s) would spawn N concurrent commits per daemon, all
+  // racing for the same nonce slot. Drop the new candle outright — the
+  // next finalized bar will fold the freshest market state when we're
+  // ready to commit again.
+  let inFlight = false;
+  let droppedSinceLastLog = 0;
   ws.on('candleClose', (candle: Candle) => {
-    void handleCandle(candle).catch((err: unknown) => {
-      log.error('paper handleCandle failed', {
-        err: err instanceof Error ? err.message : String(err),
+    if (inFlight) {
+      droppedSinceLastLog++;
+      // Throttled log so the operator can spot persistent backpressure
+      // without spamming on every drop.
+      if (droppedSinceLastLog % 10 === 1) {
+        log.warn('paper runner dropping candle (commit still in flight)', {
+          tokenId: opts.tokenId.toString(),
+          droppedSinceLastLog,
+          candleTs: candle.timestamp,
+        });
+      }
+      return;
+    }
+    inFlight = true;
+    void handleCandle(candle)
+      .catch((err: unknown) => {
+        log.error('paper handleCandle failed', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        inFlight = false;
+        droppedSinceLastLog = 0;
       });
-    });
   });
 
   ws.on('reconnect', () => {
@@ -246,4 +346,39 @@ function foldHash(prev: `0x${string}`, epoch: `0x${string}`): `0x${string}` {
   const prevBytes = Buffer.from(prev.slice(2), 'hex');
   const epochBytes = Buffer.from(epoch.slice(2), 'hex');
   return keccak256(Buffer.concat([prevBytes, epochBytes])) as `0x${string}`;
+}
+
+/**
+ * Read on-chain run state for a token so the daemon can resume after an
+ * ephemeral-disk wipe (e.g. Railway redeploy). Returns null when the run
+ * was never started or the lookup fails — the caller falls back to genesis.
+ */
+async function readChainSeed(
+  tokenId: bigint,
+): Promise<{ epochCount: number; cumulativeHash: `0x${string}` } | null> {
+  const rpc = process.env.ZA_RPC ?? 'https://evmrpc.0g.ai';
+  const addr = process.env.ZA_ADDR_LIVE_CERT;
+  if (!addr) return null;
+  try {
+    const provider = new JsonRpcProvider(rpc);
+    const c = new Contract(addr, LIVE_CERTIFICATE_ABI, provider);
+    const fn = c.getFunction('get');
+    const r = (await fn(tokenId)) as {
+      cumulativeHash: string;
+      startedAt: bigint;
+      epochCount: bigint;
+      status: bigint;
+    };
+    if (r.startedAt === 0n) return null;
+    return {
+      epochCount: Number(r.epochCount),
+      cumulativeHash: r.cumulativeHash as `0x${string}`,
+    };
+  } catch (err) {
+    log.warn('paper runner chain seed read failed', {
+      tokenId: tokenId.toString(),
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }

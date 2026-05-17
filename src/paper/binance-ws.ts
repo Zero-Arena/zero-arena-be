@@ -32,11 +32,13 @@ interface KlinePayload {
 // Spot endpoints (works from Singapore region; geo-blocked from some US ranges).
 const WS_BASE_SPOT = 'wss://stream.binance.com:9443/ws';
 const REST_KLINES_SPOT = 'https://data-api.binance.vision/api/v3/klines';
+const REST_TICKER_SPOT = 'https://data-api.binance.vision/api/v3/ticker/price';
 
 // USDT-M perpetual futures endpoints.
 const WS_BASE_PERP = 'wss://fstream.binance.com/ws';
 const REST_KLINES_PERP = 'https://fapi.binance.com/fapi/v1/klines';
 const REST_FUNDING_PERP = 'https://fapi.binance.com/fapi/v1/fundingRate';
+const REST_TICKER_PERP = 'https://fapi.binance.com/fapi/v1/ticker/price';
 
 const RECONNECT_DELAY_MS = 2000;
 
@@ -151,17 +153,30 @@ export class BinanceWS extends EventEmitter {
 
   private readonly wsBase: string;
   private readonly restKlines: string;
+  private readonly restTicker: string;
+  private readonly intervalMs: number;
 
   constructor(private readonly opts: BinanceWSOptions) {
     super();
     const isPerp = opts.market === 'perp';
     this.wsBase = isPerp ? WS_BASE_PERP : WS_BASE_SPOT;
     this.restKlines = isPerp ? REST_KLINES_PERP : REST_KLINES_SPOT;
+    this.restTicker = isPerp ? REST_TICKER_PERP : REST_TICKER_SPOT;
+    this.intervalMs = intervalToMs(opts.interval);
     this.streamUrl = `${this.wsBase}/${opts.symbol.toLowerCase()}@kline_${opts.interval}`;
   }
 
   start(): void {
     this.stopped = false;
+    // Sub-minute intervals aren't published as Binance klines. Subscribe to
+    // Bybit's V5 publicTrade WS stream (real-time tick data), bucket ticks
+    // into the requested interval, emit a synthetic candle on each boundary
+    // close. Bybit chosen over Binance @aggTrade because Binance WS pushes
+    // are unreliable from Railway Singapore (silent-socket geo throttling).
+    if (this.intervalMs < 60_000) {
+      this.startAggTradeStream(`sub-minute interval ${this.opts.interval}`);
+      return;
+    }
     const forced = (process.env.PAPER_BINANCE_MODE ?? 'auto').toLowerCase();
     if (forced === 'rest') {
       this.startRestPolling('forced by PAPER_BINANCE_MODE=rest');
@@ -372,6 +387,254 @@ export class BinanceWS extends EventEmitter {
     };
     void tick();
     this.pollHandle = setInterval(() => void tick(), REST_POLL_INTERVAL_MS);
+  }
+
+  // ─── sub-minute WS trade stream (Bybit V5 public) ──────────────────────
+
+  /**
+   * Real-time candle synthesis for sub-minute intervals. Subscribes to the
+   * Bybit V5 `publicTrade.<SYMBOL>` WebSocket stream — every executed trade
+   * is pushed with ~50-100ms latency. Bybit is used (rather than Binance
+   * `@aggTrade`) because Binance's WS pushes are unreliable from many
+   * cloud regions (Railway Singapore observed silent socket: WS handshake
+   * succeeds but Binance never pushes data, presumably IP-based throttling).
+   * Bybit's public stream is consistently reachable from global cloud IPs
+   * and the price feed for BTCUSDT linear-perp tracks Binance within ~5bp.
+   *
+   * Why not REST ticker polling: REST adds 100-500ms client→server RTT plus
+   * the daemon's own poll cadence (which can't go below the requested
+   * interval without burning request budget). With WS aggTrade we see the
+   * actual market events and the only delay is Binance's push pipeline.
+   *
+   * Why not `@kline_5s`: Binance does not publish kline products below 1m.
+   *
+   * Why not `@bookTicker`: it fires on every best-bid/ask update (often
+   * dozens per second per symbol), producing many redundant emits per
+   * bucket. aggTrade is one event per executed trade — natural granularity
+   * for a synthetic candle.
+   *
+   * Volume reflects the aggTrade quantity field, summed across the bucket
+   * — closer to true volume than the REST ticker (which gives 0).
+   *
+   * On disconnect: falls back to REST ticker polling (lower fidelity but
+   * works from any region). When the WS reconnects, takes over again.
+   */
+  private startAggTradeStream(reason: string): void {
+    if (this.stopped) return;
+    const isPerp = this.opts.market === 'perp';
+    // Bybit V5 has separate hosts for linear (USDT-M perp) vs spot.
+    const streamUrl = isPerp
+      ? 'wss://stream.bybit.com/v5/public/linear'
+      : 'wss://stream.bybit.com/v5/public/spot';
+    const bybitSymbol = this.opts.symbol.toUpperCase(); // "BTCUSDT"
+    const subscribeTopic = `publicTrade.${bybitSymbol}`;
+    log.info('bybit publicTrade stream connecting', {
+      symbol: this.opts.symbol,
+      interval: this.opts.interval,
+      intervalMs: this.intervalMs,
+      market: isPerp ? 'perp' : 'spot',
+      url: streamUrl,
+      topic: subscribeTopic,
+      reason,
+    });
+
+    // Active bucket — accumulates the LATEST OHLCV state since the last
+    // emit. Updated continuously by ws.onmessage; sampled and emitted by a
+    // wall-clock timer every intervalMs so the candle stream is paced by
+    // wall time rather than by trade arrivals (Bybit BTCUSDT linear-perp
+    // can have multi-second gaps between consecutive trades, which would
+    // stall a "emit-on-next-boundary" scheme).
+    let bucketOpen = 0;
+    let bucketHigh = -Infinity;
+    let bucketLow = Infinity;
+    let bucketClose = 0;
+    let bucketVolume = 0;
+    let bucketTicks = 0;
+    let lastEmitBoundary = -1;
+    let emitTimer: NodeJS.Timeout | null = null;
+
+    const emitNow = (): void => {
+      const now = Date.now();
+      // The last *completed* boundary at wall-clock now.
+      const boundary = Math.floor(now / this.intervalMs) * this.intervalMs - this.intervalMs;
+      if (boundary <= lastEmitBoundary) return;
+      if (bucketClose === 0) return; // nothing has been observed yet
+      const candle: Candle = {
+        timestamp: boundary,
+        open: bucketTicks > 0 ? bucketOpen : bucketClose,
+        high: bucketTicks > 0 ? bucketHigh : bucketClose,
+        low: bucketTicks > 0 ? bucketLow : bucketClose,
+        close: bucketClose,
+        volume: bucketVolume,
+      };
+      if (candle.timestamp > this.lastCloseTs) {
+        this.lastCloseTs = candle.timestamp;
+        this.emit('candleClose', candle);
+      }
+      lastEmitBoundary = boundary;
+      // Carry close forward as next bucket's open; reset H/L/V counters.
+      bucketOpen = bucketClose;
+      bucketHigh = bucketClose;
+      bucketLow = bucketClose;
+      bucketVolume = 0;
+      bucketTicks = 0;
+    };
+
+    const ws = new WebSocket(streamUrl);
+    this.ws = ws;
+    let messagesSeen = 0;
+    let firstMessageLogged = false;
+    let dataWatchdog: NodeJS.Timeout | null = null;
+
+    ws.onopen = (): void => {
+      this.wsConnectedOnce = true;
+      this.mode = 'ws';
+      // Bybit requires an explicit subscribe message after handshake.
+      ws.send(JSON.stringify({ op: 'subscribe', args: [subscribeTopic] }));
+      log.info('bybit publicTrade subscribe sent', { topic: subscribeTopic });
+      // Drive candle emission on a wall-clock timer rather than waiting for
+      // a tick to cross the next boundary. Guarantees one emit per
+      // intervalMs even during low-trade-frequency windows.
+      emitTimer = setInterval(emitNow, this.intervalMs);
+      this.emit('reconnect');
+      // If no trade message arrives within 8s of connect, treat as silent
+      // socket and fall back to REST ticker so the daemon stays alive.
+      dataWatchdog = setTimeout(() => {
+        if (messagesSeen === 0 && !this.stopped) {
+          log.warn('bybit publicTrade no data within 8s — falling back to REST', {
+            symbol: this.opts.symbol,
+          });
+          try {
+            ws.close();
+          } catch {
+            /* ignore */
+          }
+          this.startTickerSynthesisFallback('bybit silent socket');
+        }
+      }, 8_000);
+    };
+
+    ws.onmessage = (evt: MessageEvent): void => {
+      try {
+        messagesSeen++;
+        // Bybit V5 envelope: { topic, type, ts, data: [trade...] } OR
+        // subscribe ack: { success, op, conn_id }. Parse both.
+        const m = JSON.parse(evt.data as string) as {
+          topic?: string;
+          data?: Array<{ T?: number; p?: string; v?: string }>;
+          success?: boolean;
+          op?: string;
+        };
+        if (!firstMessageLogged) {
+          firstMessageLogged = true;
+          log.info('bybit publicTrade first message', {
+            symbol: this.opts.symbol,
+            payload: (evt.data as string).slice(0, 200),
+          });
+        }
+        if (m.op === 'subscribe' && m.success === false) {
+          log.error('bybit publicTrade subscribe failed', { payload: (evt.data as string).slice(0, 200) });
+          return;
+        }
+        if (!m.topic || m.topic !== subscribeTopic || !Array.isArray(m.data)) {
+          return; // ack or unrelated frame
+        }
+        for (const trade of m.data) {
+          const price = trade.p !== undefined ? Number(trade.p) : NaN;
+          const qty = trade.v !== undefined ? Number(trade.v) : 0;
+          if (!Number.isFinite(price) || price <= 0) continue;
+          if (bucketTicks === 0) {
+            bucketOpen = price;
+            bucketHigh = price;
+            bucketLow = price;
+          }
+          bucketClose = price;
+          if (price > bucketHigh) bucketHigh = price;
+          if (price < bucketLow) bucketLow = price;
+          bucketVolume += qty;
+          bucketTicks++;
+        }
+      } catch (err) {
+        this.emit('error', err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+
+    ws.onerror = (evt: Event): void => {
+      log.warn('bybit publicTrade ws error', { evt: String(evt.type) });
+      this.emit('error', new Error('bybit ws transport error'));
+    };
+
+    ws.onclose = (evt: { code: number }): void => {
+      if (dataWatchdog) {
+        clearTimeout(dataWatchdog);
+        dataWatchdog = null;
+      }
+      if (emitTimer) {
+        clearInterval(emitTimer);
+        emitTimer = null;
+      }
+      log.warn('bybit publicTrade ws closed', { code: evt.code, messagesSeen });
+      this.ws = null;
+      if (this.stopped) return;
+      // Reconnect after backoff. If WS chronically fails (region block),
+      // fall back to REST ticker polling so the daemon stays alive.
+      if (this.wsConnectedOnce && messagesSeen > 0) {
+        setTimeout(() => this.startAggTradeStream('reconnect'), RECONNECT_DELAY_MS);
+      } else {
+        log.warn('binance-aggTrade no data — falling back to REST ticker', {
+          symbol: this.opts.symbol,
+          messagesSeen,
+        });
+        this.startTickerSynthesisFallback('aggTrade ws unreachable');
+      }
+    };
+  }
+
+  /**
+   * REST ticker fallback — only used when the aggTrade WS can't connect
+   * (region-blocked). Strictly worse fidelity than WS (no intra-bar OHLC,
+   * volume=0), but keeps the daemon running.
+   */
+  private startTickerSynthesisFallback(reason: string): void {
+    if (this.pollHandle || this.stopped) return;
+    this.mode = 'rest';
+    log.info('binance-ticker REST fallback start', {
+      symbol: this.opts.symbol,
+      interval: this.opts.interval,
+      pollMs: this.intervalMs,
+      reason,
+    });
+    this.emit('reconnect');
+    const tick = async (): Promise<void> => {
+      if (this.stopped) return;
+      try {
+        const url = new URL(this.restTicker);
+        url.searchParams.set('symbol', this.opts.symbol.toUpperCase());
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`ticker ${res.status}`);
+        const body = (await res.json()) as { price: string };
+        const price = Number(body.price);
+        if (!Number.isFinite(price) || price <= 0) return;
+        const now = Date.now();
+        const ts = Math.floor(now / this.intervalMs) * this.intervalMs;
+        if (ts <= this.lastCloseTs) return;
+        this.lastCloseTs = ts;
+        this.emit('candleClose', {
+          timestamp: ts,
+          open: price,
+          high: price,
+          low: price,
+          close: price,
+          volume: 0,
+        });
+      } catch (err) {
+        log.warn('binance-ticker REST fallback error', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+    void tick();
+    this.pollHandle = setInterval(() => void tick(), this.intervalMs);
   }
 
   /** Fetch the most recent fully-closed candle. */

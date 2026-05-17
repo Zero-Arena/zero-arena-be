@@ -11,6 +11,34 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Trade } from 'zeroarena';
 
+/**
+ * Live (off-chain) metrics computed over the LIFETIME equity curve, not the
+ * per-epoch slice. Refreshed by the runner every candle close and exposed
+ * via the orchestrator's `/state/:tokenId` HTTP endpoint so the FE can show
+ * Live Return / Sharpe / Win Rate / Max DD without waiting for the next
+ * on-chain epoch commit (which only fires every `barsPerEpoch` bars).
+ */
+export interface LiveMetricsSnapshot {
+  /** Total return since the engine started, in basis points (signed). */
+  totalReturnBps: number;
+  /** Annualized Sharpe × 1000 (>=0; 0 when n<2 or std=0). */
+  sharpeX1000: number;
+  /** Max drawdown over the lifetime equity curve, in basis points. */
+  maxDrawdownBps: number;
+  /** Win rate over closed positions × 10000. */
+  winRateBps: number;
+  /** Profit factor × 1000, capped at 100,000. */
+  profitFactorX1000: number;
+  /** Number of closed positions so far. */
+  numClosedTrades: number;
+  /** Total trade events (opens + closes + flips + liquidations). */
+  totalTradeEvents: number;
+  /** Latest equity in quote currency. */
+  equity: number;
+  /** Latest observed close price. */
+  lastPrice: number;
+}
+
 export interface PaperSnapshot {
   schema: 'zeroarena.paper.snapshot.v1';
   tokenId: string; // bigint serialized
@@ -23,6 +51,8 @@ export interface PaperSnapshot {
   pendingTrades: Trade[];
   /** Equity log for the current epoch (`barsPerEpoch` entries max). */
   pendingEquity: number[];
+  /** Lifetime metrics — present for snapshots written ≥ v0.3.1; absent on resume from older snapshots. */
+  liveMetrics?: LiveMetricsSnapshot;
 }
 
 const SCHEMA = 'zeroarena.paper.snapshot.v1' as const;
