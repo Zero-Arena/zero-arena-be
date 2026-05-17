@@ -1,10 +1,17 @@
 // HTTP server for the onboard service. Routes:
-//   GET  /health     → readiness + operator address
-//   POST /onboard    → owner submits agent + signed authorization
-//   POST /offboard   → owner revokes; daemon stops
-//   GET  /status     → list of active delegated daemons
+//   GET  /health             → readiness + operator address
+//   POST /onboard            → owner submits agent + signed authorization
+//   POST /offboard           → owner revokes; daemon stops
+//   GET  /status             → list of active delegated daemons
+//   GET  /state/:tokenId     → live off-chain metrics (return/sharpe/dd/winRate)
+//                              for one onboarded token, read from the daemon's
+//                              snapshot file. Updated every candle close
+//                              (~1s with sub-minute intervals); use this for
+//                              FE real-time leaderboard cells while the
+//                              chain-anchor view stays at `barsPerEpoch` cadence.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { resolve as resolvePath } from 'node:path';
 import { log } from '../log.js';
 import { onboardConfig } from './config.js';
 import { operatorAddress, recoverSigner, verifyOwnerAndAuthorization } from './auth.js';
@@ -16,13 +23,14 @@ import {
 } from './validate.js';
 import { installShutdownHandlers, isActive, listActive, startDaemon, stopDaemon } from './orchestrator.js';
 import { decryptAgentBundle, operatorPubKey, SCHEME_V1 } from './crypto.js';
+import { loadSnapshot } from '../paper/snapshot.js';
 
 const MAX_BODY_BYTES = 256 * 1024; // 256 KiB — leaves room for a reasonable agent source
 
 class RateLimiter {
   private readonly hits = new Map<string, number[]>();
-  private readonly windowMs = 60_000;
-  private readonly max = 10; // 10 onboard/offboard per minute per IP
+
+  constructor(private readonly windowMs: number, private readonly max: number) {}
 
   check(ip: string): { ok: boolean; retryAfter?: number } {
     const now = Date.now();
@@ -42,7 +50,11 @@ class RateLimiter {
   }
 }
 
-const limiter = new RateLimiter();
+// Tight cap for write paths (onboard/offboard mutate operator state).
+const limiter = new RateLimiter(60_000, 10);
+// Looser cap for /state reads: a FE leaderboard polling every 1s per token
+// on 5 tokens is 5 req/s = 300 req/min/IP, so allow 600/min headroom.
+const stateLimiter = new RateLimiter(60_000, 600);
 
 function clientIp(req: IncomingMessage): string {
   const fwd = req.headers['x-forwarded-for'];
@@ -73,6 +85,13 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
+    // GET /state/:tokenId is consumed by the FE browser bundle — return
+    // permissive CORS so any origin can fetch live metrics. Write routes
+    // (onboard/offboard) are gated by bearer auth + EIP-191 signature, so
+    // open CORS doesn't widen attack surface beyond the read paths.
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, POST',
+    'access-control-allow-headers': 'authorization, content-type',
   });
   res.end(payload);
 }
@@ -102,6 +121,63 @@ async function handleStatus(_req: IncomingMessage, res: ServerResponse): Promise
       pid: d.pid,
       startedAt: new Date(d.startedAt).toISOString(),
     })),
+  });
+}
+
+/**
+ * GET /state/:tokenId — return the daemon's most recent off-chain snapshot
+ * for a single onboarded token. Reads `./data/paper/snapshot-{tokenId}.json`
+ * (atomic-replace written by the runner every candle close) and returns the
+ * embedded `liveMetrics`. No auth required — this is read-only public state.
+ *
+ * Response shape:
+ *   {
+ *     tokenId: "2",
+ *     active: true,
+ *     lastCandleTs: 1778990010000,
+ *     lastCandleTsIso: "2026-05-17T03:53:30.000Z",
+ *     barIndex: 123,
+ *     epochIndex: 5,
+ *     liveMetrics: { totalReturnBps, sharpeX1000, maxDrawdownBps, winRateBps,
+ *                    profitFactorX1000, numClosedTrades, totalTradeEvents,
+ *                    equity, lastPrice }
+ *   }
+ *
+ * 404 when the daemon has never run for that token (no snapshot file).
+ */
+async function handleState(req: IncomingMessage, tokenIdStr: string, res: ServerResponse): Promise<void> {
+  const ip = clientIp(req);
+  const rate = stateLimiter.check(ip);
+  if (!rate.ok) {
+    res.setHeader('retry-after', String(rate.retryAfter ?? 60));
+    json(res, 429, { error: 'rate limited' });
+    return;
+  }
+  // Strict numeric parse — reject "12abc" etc.
+  if (!/^\d+$/.test(tokenIdStr)) {
+    json(res, 400, { error: 'tokenId must be a positive integer' });
+    return;
+  }
+  const tokenId = BigInt(tokenIdStr);
+  // Mirror the path the orchestrator passes to the runner — both sides
+  // resolve relative to `onboardConfig.agentDir` so the snapshot lives on
+  // the persistent volume (no reset on Railway redeploy).
+  const snapshotPath = resolvePath(onboardConfig.agentDir, '..', 'paper', `snapshot-${tokenId.toString()}.json`);
+  const snap = await loadSnapshot(snapshotPath);
+  if (!snap) {
+    json(res, 404, { error: 'no snapshot for tokenId', tokenId: tokenId.toString() });
+    return;
+  }
+  json(res, 200, {
+    tokenId: snap.tokenId,
+    active: isActive(tokenId),
+    lastCandleTs: snap.lastCandleTs,
+    lastCandleTsIso: new Date(snap.lastCandleTs).toISOString(),
+    barIndex: snap.barIndex,
+    epochIndex: snap.epochIndex,
+    cumulativeHash: snap.cumulativeHash,
+    startedAt: snap.startedAt,
+    liveMetrics: snap.liveMetrics ?? null,
   });
 }
 
@@ -219,6 +295,11 @@ export function startServer(): void {
         if (req.method === 'GET' && req.url === '/status') return handleStatus(req, res);
         if (req.method === 'POST' && req.url === '/onboard') return handleOnboard(req, res);
         if (req.method === 'POST' && req.url === '/offboard') return handleOffboard(req, res);
+        // GET /state/:tokenId — public read of live off-chain metrics.
+        if (req.method === 'GET' && req.url && req.url.startsWith('/state/')) {
+          const tokenIdStr = req.url.slice('/state/'.length).split('?')[0]!;
+          return handleState(req, tokenIdStr, res);
+        }
         json(res, 404, { error: 'not found' });
       } catch (err: unknown) {
         if (err instanceof HttpError) {

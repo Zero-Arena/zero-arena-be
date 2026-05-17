@@ -24,10 +24,36 @@ function optional(name: string, fallback: string): string {
   return v && v.length > 0 ? v : fallback;
 }
 
+/**
+ * Parse OPERATOR_KEYS_POOL (csv of private keys) into an array. Returns the
+ * single OPERATOR_PRIVATE_KEY wrapped as a one-element array when the pool
+ * env is not set — preserving v0.3 single-wallet behavior.
+ *
+ * The pool exists to dodge nonce contention: each onboarded tokenId is
+ * assigned a distinct wallet so 5 daemons committing every 1s don't fight
+ * over the same operator wallet's nonce. Each key must be pre-authorized in
+ * `LiveCertificate.authorizedUpdaters` (operator-only setup, not per-call).
+ */
+function readKeyPool(): string[] {
+  const raw = process.env.OPERATOR_KEYS_POOL;
+  if (raw && raw.length > 0) {
+    const keys = raw.split(',').map((k) => k.trim()).filter(Boolean);
+    if (keys.length === 0) {
+      throw new Error('OPERATOR_KEYS_POOL is set but empty after parse');
+    }
+    return keys;
+  }
+  return [required('OPERATOR_PRIVATE_KEY')];
+}
+
 export const onboardConfig = {
   /** ZA's operator wallet — must be an authorized updater for every onboarded tokenId. */
   get operatorPrivateKey(): string {
     return required('OPERATOR_PRIVATE_KEY');
+  },
+  /** Pool of operator wallets — orchestrator assigns one per tokenId. */
+  get operatorKeyPool(): string[] {
+    return readKeyPool();
   },
   /** 0G mainnet RPC (chainId 16661) for ownership + authorization checks. */
   rpc: optional('ZA_RPC', 'https://evmrpc.0g.ai'),

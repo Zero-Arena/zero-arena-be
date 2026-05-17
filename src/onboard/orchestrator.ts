@@ -36,6 +36,20 @@ function key(tokenId: bigint): string {
   return tokenId.toString();
 }
 
+/**
+ * Deterministically map a tokenId to one of the operator wallets in the pool.
+ * Using modulo keeps the assignment stable across restarts (same token always
+ * gets the same wallet) — important so the same on-chain nonce sequence
+ * continues after a Railway redeploy.
+ *
+ * Falls back to a single-wallet pool when OPERATOR_KEYS_POOL is unset.
+ */
+function pickOperatorKey(tokenId: bigint): { key: string; index: number } {
+  const pool = onboardConfig.operatorKeyPool;
+  const idx = Number(tokenId % BigInt(pool.length));
+  return { key: pool[idx]!, index: idx };
+}
+
 async function writeAgentSource(tokenId: bigint, source: string): Promise<string> {
   const filePath = resolvePath(onboardConfig.agentDir, `agent-${tokenId.toString()}.ts`);
   await mkdir(dirname(filePath), { recursive: true });
@@ -63,7 +77,13 @@ export async function startDaemon(spec: DaemonSpec): Promise<ActiveDaemon> {
   }
 
   const agentPath = await writeAgentSource(spec.tokenId, spec.agentSource);
-  log.info('onboard.spawn.start', { tokenId: k, agentPath });
+  const walletAssign = pickOperatorKey(spec.tokenId);
+  log.info('onboard.spawn.start', {
+    tokenId: k,
+    agentPath,
+    operatorIndex: walletAssign.index,
+    poolSize: onboardConfig.operatorKeyPool.length,
+  });
 
   const child = spawn(
     'npx',
@@ -83,8 +103,16 @@ export async function startDaemon(spec: DaemonSpec): Promise<ActiveDaemon> {
         PAPER_FEE_BPS: String(spec.feeBps),
         PAPER_SLIPPAGE_BPS: String(spec.slippageBps),
         PAPER_DRY_RUN: 'false',
-        PAPER_SNAPSHOT_PATH: resolvePath(`./data/paper/snapshot-${k}.json`),
-        OPERATOR_PRIVATE_KEY: onboardConfig.operatorPrivateKey,
+        // Place snapshots under the persistent Railway volume mount
+        // (`/app/data/onboard` → `onboard-volume`). Without this they live
+        // on the ephemeral container disk and reset on every redeploy,
+        // which the runner papers over via `readChainSeed()` but at the
+        // cost of resetting `liveMetrics` until the next epoch fold-in.
+        PAPER_SNAPSHOT_PATH: resolvePath(onboardConfig.agentDir, '..', 'paper', `snapshot-${k}.json`),
+        // Deterministic per-token wallet from the operator pool. Each child
+        // process runs with its own OPERATOR_PRIVATE_KEY so the 5 daemons
+        // don't fight over a single wallet's nonce when committing 1 tx/s.
+        OPERATOR_PRIVATE_KEY: pickOperatorKey(spec.tokenId).key,
         // Force REST polling instead of WebSocket. From Railway Singapore the
         // perp WS connects but `kline.x === true` events were not arriving
         // reliably in earlier trials — REST pulls the latest closed candle
